@@ -141,94 +141,77 @@ async def fetch_month_stats(user_id: int, ym_period: str = None):
             return await cursor.fetchall()
 
 
-# ---------------- УНИВЕРСАЛЬНЫЙ ПАРСИНГ EXCEL И CSV ----------------
+# ---------------- ТОЧНЫЙ ПАРСИНГ EXCEL ----------------
 def parse_excel_or_csv(file_path):
-    rows_data = []
+    expenses = []
 
-    if file_path.lower().endswith(".csv"):
-        for enc in ["utf-8-sig", "utf-8", "cp1251"]:
-            try:
-                with open(file_path, "r", encoding=enc) as f:
-                    sample = f.read(2048)
-                    f.seek(0)
-                    delimiter = ";" if ";" in sample else ","
-                    reader = csv.reader(f, delimiter=delimiter)
-                    rows_data = [row for row in reader if any(cell.strip() for cell in row)]
-                if rows_data:
-                    break
-            except Exception:
-                continue
-    else:
-        try:
-            wb = openpyxl.load_workbook(file_path, data_only=True)
-            sheet = wb.active
-            for row in sheet.iter_rows(values_only=True):
-                if any(row):
-                    rows_data.append([str(c) if c is not None else "" for c in row])
-        except Exception as e:
-            logging.error(f"Excel read error: {e}")
+    try:
+        wb = openpyxl.load_workbook(file_path, data_only=True)
+        sheets = wb.worksheets
+    except Exception as e:
+        logging.error(f"Excel read error: {e}")
+        sheets = []
 
-    if not rows_data or len(rows_data) < 2:
-        return []
+    for sheet in sheets:
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows or len(rows) < 2:
+            continue
 
-    header_idx = -1
-    col_date = -1
-    col_cat = -1
-    col_amt = -1
-    col_type = -1
-    col_desc = -1
-
-    for idx, row in enumerate(rows_data[:5]):
-        lower_row = [str(c).lower().strip() for c in row]
-        for c_i, cell in enumerate(lower_row):
-            if any(w in cell for w in ["дат", "date", "time", "время"]):
-                col_date = c_i
-            elif any(w in cell for w in ["категор", "category", "статья"]):
-                col_cat = c_i
-            elif any(w in cell for w in ["сумм", "amount", "цена", "расход", "стоимость", "money", "sum"]):
-                col_amt = c_i
-            elif any(w in cell for w in ["тип", "type", "вид"]):
-                col_type = c_i
-            elif any(w in cell for w in ["примечан", "комментар", "описан", "заметк", "note", "comment", "desc", "memo"]):
-                col_desc = c_i
-
-        if col_date != -1 and col_cat != -1 and col_amt != -1:
-            header_idx = idx
-            break
-
-    if header_idx == -1:
-        header_idx = 0
+        # Ищем строку с заголовками колонок (где есть "Дата" или "Категория")
+        header_idx = -1
         col_date = 0
         col_cat = 1
-        col_amt = 2
+        col_amt = 3  # Колонка D по умолчанию (Сумма в валюте счета)
+        col_desc = 8  # Колонка I по умолчанию (Комментарий)
 
-    expenses = []
-    for row in rows_data[header_idx + 1:]:
-        if len(row) <= max(col_date, col_cat, col_amt):
-            continue
+        for r_i, r in enumerate(rows[:6]):
+            r_str = [str(c).lower().strip() if c is not None else "" for c in r]
+            for c_i, cell in enumerate(r_str):
+                if "дата" in cell:
+                    col_date = c_i
+                    header_idx = r_i
+                elif "категория" in cell:
+                    col_cat = c_i
+                    header_idx = r_i
+                elif "сумма в валюте" in cell:
+                    col_amt = c_i
+                elif "комментарий" in cell or "теги" in cell:
+                    col_desc = c_i
 
-        raw_type = str(row[col_type]).lower().strip() if (col_type != -1 and col_type < len(row)) else ""
-        if any(w in raw_type for w in ["доход", "income", "перевод", "transfer"]):
-            continue
+            if header_idx != -1:
+                break
 
-        raw_cat = str(row[col_cat]).strip()
-        raw_amt = str(row[col_amt]).strip()
-        raw_date = row[col_date]
-        raw_desc = str(row[col_desc]).strip() if (col_desc != -1 and col_desc < len(row)) else ""
+        start_row = (header_idx + 1) if header_idx != -1 else 2
 
-        if not raw_cat or not raw_amt:
-            continue
+        for r in rows[start_row:]:
+            if not r or len(r) <= max(col_date, col_cat, col_amt):
+                continue
 
-        clean_amt_str = re.sub(r"[^\d.,\-]", "", raw_amt).replace(",", ".")
-        try:
-            amt = abs(float(clean_amt_str))
+            raw_date = r[col_date]
+            raw_cat = r[col_cat]
+            raw_amt = r[col_amt]
+            raw_desc = r[col_desc] if (col_desc != -1 and col_desc < len(r)) else ""
+
+            if raw_date is None or raw_cat is None or raw_amt is None:
+                continue
+
+            cat_str = str(raw_cat).strip()
+            if not cat_str or any(cat_str.lower().startswith(w) for w in ["список", "категория", "дата"]):
+                continue
+
+            # Парсим сумму (убираем пробелы, меняем запятую на точку)
+            amt_str = str(raw_amt).replace(" ", "").replace("\xa0", "").replace(",", ".").strip()
+            match = re.search(r"(\d+(?:\.\d+)?)", amt_str)
+            if not match:
+                continue
+            amt = float(match.group(1))
             if amt == 0:
                 continue
-        except ValueError:
-            continue
 
-        dt_str = normalize_date_string(raw_date)
-        expenses.append((raw_cat, amt, raw_desc, dt_str))
+            dt_str = normalize_date_string(raw_date)
+            desc_str = str(raw_desc).strip() if raw_desc is not None else ""
+
+            expenses.append((cat_str, amt, desc_str, dt_str))
 
     return expenses
 
@@ -276,7 +259,7 @@ dp = Dispatcher(storage=MemoryStorage())
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await ensure_default_categories(message.from_user.id)
-    text = "👋 Привет! Я твой бот учета финансов с умной аналитикой.\n\n💡 **Как вносить траты:**\n• С названием товара: `420 шампунь` или `890 корм` ➔ выбери категорию.\n• Или просто сумму: `350` ➔ категорию выбери кнопкой.\n\n📁 **Импорт истории:** отправьте сюда файл Excel (`.xlsx`) или `.csv`, выгруженный из вашего приложения!"
+    text = "👋 Привет! Я твой бот учета финансов с умной аналитикой.\n\n💡 **Как вносить траты:**\n• С названием товара: `420 шампунь` или `890 корм` ➔ выбери категорию.\n• Или просто сумму: `350` ➔ категорию выбери кнопкой.\n\n📁 **Импорт истории:** отправьте сюда файл Excel (`.xlsx`), выгруженный из вашего приложения!"
     await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
 @dp.message(F.text == "/clear_expenses")
@@ -287,7 +270,7 @@ async def cmd_clear_expenses(message: types.Message):
         await db.commit()
     await message.answer("🧹 База расходов полностью очищена.")
 
-# ПРИЕМ ФАЙЛОВ EXCEL И CSV
+# ПРИЕМ ФАЙЛОВ EXCEL
 @dp.message(F.document)
 async def handle_excel_document(message: types.Message):
     doc = message.document
@@ -295,9 +278,10 @@ async def handle_excel_document(message: types.Message):
     user_id = message.from_user.id
 
     if not (fname.endswith(".xlsx") or fname.endswith(".xls") or fname.endswith(".csv")):
-        await message.answer("Пожалуйста, отправьте файл таблицы в формате **`.xlsx`** или **`.csv`**.")
+        await message.answer("Пожалуйста, отправьте файл таблицы в формате **`.xlsx`**.")
         return
 
+    # Удаляем старую тестовую категорию "Другое"
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM expenses WHERE user_id = ? AND category_name = '📦 Другое'", (user_id,))
         await db.execute("DELETE FROM categories WHERE user_id = ? AND name = '📦 Другое'", (user_id,))
@@ -314,7 +298,7 @@ async def handle_excel_document(message: types.Message):
         expenses = parse_excel_or_csv(local_path)
 
         if not expenses:
-            await status_msg.edit_text("❌ В таблице не удалось распознать строки с расходами. Проверьте, есть ли в файле колонки с датой, категорией и суммой.")
+            await status_msg.edit_text("❌ В таблице не удалось распознать строки с расходами.")
             return
 
         await ensure_default_categories(user_id)
