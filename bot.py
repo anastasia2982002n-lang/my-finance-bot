@@ -42,6 +42,26 @@ MONTH_NAMES = {
     "09": "Сентябрь", "10": "Октябрь", "11": "Ноябрь", "12": "Декабрь"
 }
 
+DEFAULT_CAT_NAMES = {
+    "defaulthome": "🏠 Дом",
+    "defaultfood": "🛒 Продукты",
+    "defaultgroceries": "🛒 Продукты",
+    "defaulttransport": "🚕 Транспорт",
+    "defaultcar": "🚗 Автомобиль",
+    "defaultcafe": "☕ Кафе",
+    "defaultrestaurant": "🍽 Рестораны",
+    "defaultbeauty": "💅 Красота",
+    "defaulthealth": "💊 Здоровье",
+    "defaultclothes": "👗 Одежда",
+    "defaultentertainment": "🎬 Развлечения",
+    "defaultpet": "🐱 Кошка / Питомцы",
+    "defaultcat": "🐱 Кошка",
+    "defaultbills": "📄 Счета и связь",
+    "defaulteducation": "📚 Образование",
+    "defaulttravel": "✈️ Путешествия",
+    "defaultother": "📦 Другое"
+}
+
 PENDING_EXPENSES = {}
 
 class Form(StatesGroup):
@@ -75,7 +95,9 @@ def get_month_title(ym_str: str) -> str:
     except Exception:
         return ym_str
 
-def parse_created_date(val):
+def parse_created_date(val, fallback_date=None):
+    if not val and fallback_date:
+        val = fallback_date
     if val is None:
         return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     if isinstance(val, (int, float)) or (isinstance(val, str) and val.replace(".", "", 1).isdigit()):
@@ -142,90 +164,128 @@ async def fetch_month_stats(user_id: int, ym_period: str = None):
             return await cursor.fetchall()
 
 
-# ---------------- ПАРСИНГ И ДЕТАЛЬНАЯ ДИАГНОСТИКА ----------------
+# ---------------- ПАРСИНГ БАЗЫ ДАННЫХ ----------------
 def parse_backup_sqlite(sqlite_path):
     conn = sqlite3.connect(sqlite_path)
     cursor = conn.cursor()
 
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-    tables = [r[0].lower() for r in cursor.fetchall()]
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+    all_tables = [r[0] for r in cursor.fetchall()]
 
     expenses = []
     debug_info = ""
 
-    if "category" in tables and "transaction" in tables:
+    # 1. Читаем категории из таблицы category
+    cat_map = {}
+    if "category" in all_tables:
         cursor.execute("PRAGMA table_info('category');")
         cat_cols = [c[1] for c in cursor.fetchall()]
         cursor.execute("SELECT * FROM category;")
-        cat_rows = cursor.fetchall()
+        for r in cursor.fetchall():
+            uid = str(r[0]).strip()
+            title = str(r[3]).strip() if len(r) > 3 and r[3] else ""
+            ctype = str(r[4]).strip() if len(r) > 4 and r[4] else ""
 
-        idx_c_uid = next((i for i, c in enumerate(cat_cols) if c.lower() in ["uid", "id"]), 0)
-        idx_c_title = next((i for i, c in enumerate(cat_cols) if c.lower() in ["title", "name"]), 3)
+            # Если это категория дохода — пропускаем
+            if ctype.lower() == "income" or title.lower() in ["зарплата", "доход", "доходы", "salary", "income"]:
+                continue
 
-        cat_map = {}
-        for row in cat_rows:
-            uid = str(row[idx_c_uid])
-            title = str(row[idx_c_title]).strip()
+            # Если у категории пустое системное имя — переводим его
+            if not title:
+                clean_uid_key = uid.lower().replace("_", "").replace("-", "")
+                title = DEFAULT_CAT_NAMES.get(clean_uid_key, uid)
+
             cat_map[uid] = title
 
+    # 2. Ищем таблицу-связку между transaction и category
+    tx_to_cat = {}
+    link_table_found = None
+    for t in all_tables:
+        if t.lower() in ["user", "syncable_settings", "colors", "category", "transaction"]:
+            continue
+        cursor.execute(f"PRAGMA table_info('{t}');")
+        cols = {c[1].lower(): c[1] for c in cursor.fetchall()}
+
+        col_tx = next((cols[c] for c in cols if any(k in c for k in ["trans", "tx"])), None)
+        col_cat = next((cols[c] for c in cols if "cat" in c), None)
+
+        if col_tx and col_cat:
+            link_table_found = t
+            cursor.execute(f"SELECT {col_tx}, {col_cat} FROM '{t}';")
+            for r_tx, r_cat in cursor.fetchall():
+                if r_tx and r_cat:
+                    tx_to_cat[str(r_tx).strip()] = str(r_cat).strip()
+            if tx_to_cat:
+                break
+
+    # 3. Читаем транзакции
+    if "transaction" in all_tables:
         cursor.execute("PRAGMA table_info('transaction');")
         tx_cols = [c[1] for c in cursor.fetchall()]
-
         cursor.execute("SELECT * FROM 'transaction';")
         tx_rows = cursor.fetchall()
 
-        idx_amt = next((i for i, c in enumerate(tx_cols) if "amountindefaultcurrency" in c.lower()), None)
-        if idx_amt is None:
-            idx_amt = next((i for i, c in enumerate(tx_cols) if "amount" in c.lower()), 4)
-
-        idx_date = next((i for i, c in enumerate(tx_cols) if c.lower() in ["created", "date"]), 1)
-        idx_note = next((i for i, c in enumerate(tx_cols) if c.lower() in ["note", "comment", "description", "memo"]), None)
-        idx_rem = next((i for i, c in enumerate(tx_cols) if "remove" in c.lower() or "delete" in c.lower()), None)
-
-        skip_reasons = {"no_cat": 0, "amt_zero": 0, "removed": 0, "amt_none": 0}
+        idx_uid = tx_cols.index("uid") if "uid" in tx_cols else 0
+        idx_type = tx_cols.index("type") if "type" in tx_cols else 3
+        idx_amt = tx_cols.index("amountInDefaultCurrency") if "amountInDefaultCurrency" in tx_cols else 4
+        idx_created = tx_cols.index("created") if "created" in tx_cols else 1
+        idx_date = tx_cols.index("date") if "date" in tx_cols else None
+        idx_comment = tx_cols.index("comment") if "comment" in tx_cols else None
+        idx_rem = tx_cols.index("isRemoved") if "isRemoved" in tx_cols else None
 
         for r in tx_rows:
+            # Пропускаем удаленные
             if idx_rem is not None and r[idx_rem] in [1, "1", True, "true"]:
-                skip_reasons["removed"] += 1
                 continue
 
-            matched_cat = None
-            for val in r:
-                if val is not None and str(val) in cat_map:
-                    matched_cat = cat_map[str(val)]
-                    break
-
-            if not matched_cat:
-                skip_reasons["no_cat"] += 1
+            # Берем только расходы (пропускаем Income и Transfer)
+            t_type = str(r[idx_type]).strip().lower() if r[idx_type] else ""
+            if t_type in ["income", "transfer", "1"]:
                 continue
+
+            tx_uid = str(r[idx_uid]).strip()
+
+            # Ищем привязанную категорию
+            cat_name = None
+            if tx_uid in tx_to_cat:
+                cat_uid = tx_to_cat[tx_uid]
+                cat_name = cat_map.get(cat_uid)
+            else:
+                # Если связки нет в отдельной таблице, ищем ID категории внутри самой строки
+                for val in r:
+                    if val is not None and str(val).strip() in cat_map:
+                        cat_name = cat_map[str(val).strip()]
+                        break
+
+            if not cat_name:
+                cat_name = "📦 Другое"
 
             raw_amt = r[idx_amt]
             if raw_amt is None:
-                skip_reasons["amt_none"] += 1
                 continue
             try:
                 amt = abs(float(raw_amt))
+                # Если сумма записана в копейках (больше 1000 и кратна 100 для повседневных трат)
+                if amt >= 10000 and amt % 100 == 0:
+                    amt = amt / 100.0
                 if amt == 0:
-                    skip_reasons["amt_zero"] += 1
                     continue
             except (ValueError, TypeError):
-                skip_reasons["amt_none"] += 1
                 continue
 
-            raw_date = r[idx_date]
+            raw_date = r[idx_date] if idx_date is not None and r[idx_date] else r[idx_created]
             dt_str = parse_created_date(raw_date)
-            desc = str(r[idx_note]).strip() if (idx_note is not None and r[idx_note]) else ""
+            desc = str(r[idx_comment]).strip() if (idx_comment is not None and r[idx_comment]) else ""
 
-            expenses.append((matched_cat, amt, desc, dt_str))
+            expenses.append((cat_name, amt, desc, dt_str))
 
         if not expenses:
-            first_tx = tx_rows[0] if tx_rows else "нет"
-            first_cat = cat_rows[0] if cat_rows else "нет"
+            sample_exp = next((r for r in tx_rows if str(r[idx_type]).lower() == "expense"), None)
             debug_info = (
-                f"Все колонки transaction:\n{tx_cols}\n\n"
-                f"Пример транзакции:\n{first_tx}\n\n"
-                f"Пример категории:\n{first_cat}\n\n"
-                f"Причины пропуска: {skip_reasons}"
+                f"Все таблицы: {all_tables}\n\n"
+                f"Таблица связки найдена: {link_table_found} (связей: {len(tx_to_cat)})\n\n"
+                f"Категорий в карте: {len(cat_map)}\n\n"
+                f"Пример расхода (Expense): {sample_exp}"
             )
 
     conn.close()
@@ -277,9 +337,10 @@ async def cmd_start(message: types.Message):
     await ensure_default_categories(message.from_user.id)
     text = (
         "👋 Привет! Я твой бот учета финансов.\n\n"
-        "💡 **Как вносить траты:**\n"
-        "• С названием товара: `420 шампунь` или `890 корм` ➔ выбери категорию.\n"
-        "• Или просто сумму: `350` ➔ название можно задать в любой момент!\n\n"
+        "💡 **Как пользоваться:**\n"
+        "• **Внести расход:** напиши сумму с названием товара или без (например, `420 шампунь` или `300`).\n"
+        "• **📊 Текущий месяц / 📅 Выбрать месяц:** статистика трат по месяцам.\n"
+        "• **📂 Мои категории:** просмотр трат, редактирование и умная аналитика.\n\n"
         "📁 **Импорт:** отправьте в чат ваш файл архива (`.zip` или `.mmbackup`)."
     )
     await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
@@ -326,7 +387,7 @@ async def handle_backup_document(message: types.Message):
         expenses, debug_info = parse_backup_sqlite(extracted_db)
 
         if not expenses:
-            await status_msg.edit_text(f"⚠️ **Не удалось привязать расходы.**\n\nВот точные данные из базы:\n\n`{debug_info}`")
+            await status_msg.edit_text(f"⚠️ **Не удалось связать расходы.**\n\nОтладка:\n`{debug_info}`")
             return
 
         await ensure_default_categories(user_id)
@@ -357,7 +418,7 @@ async def handle_backup_document(message: types.Message):
             f"• Категорий: **{len(imported_cats)}**\n"
             f"• Общая сумма: **{total_sum:.2f} руб.**\n"
             f"• Период: **{date_range}**\n\n"
-            f"Все данные распределены по месяцам и категориям!"
+            f"Вся история распределена по месяцам! Нажмите **📊 Текущий месяц** или **📅 Выбрать месяц**."
         )
         await status_msg.edit_text(report_text, parse_mode="Markdown")
 
