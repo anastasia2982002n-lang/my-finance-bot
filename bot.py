@@ -236,7 +236,7 @@ async def callback_cancel(callback: types.CallbackQuery):
     await callback.message.edit_text("Отменено.")
     await callback.answer()
 
-# Простой веб-сервер, который требует бесплатный тариф Render
+# Простой веб-сервер для Render
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
 
@@ -253,14 +253,6 @@ async def main():
     await init_db()
     await start_web_server()
     print(">>> Бот запущен на Render! <<<")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())async def main():
-    await init_db()
-    print("==================================================")
-    print(">>> Бот запущен! Напишите ему /start в Telegram <<<")
-    print("==================================================")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
