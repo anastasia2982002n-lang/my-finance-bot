@@ -75,6 +75,26 @@ def get_month_title(ym_str: str) -> str:
     except Exception:
         return ym_str
 
+def parse_created_date(val):
+    if val is None:
+        return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    # Если таймштамп в миллисекундах или секундах
+    if isinstance(val, (int, float)) or (isinstance(val, str) and val.replace(".", "", 1).isdigit()):
+        v = float(val)
+        if v > 10_000_000_000:
+            v /= 1000.0
+        try:
+            return datetime.datetime.utcfromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    # Если строка даты
+    s = str(val).replace("T", " ").replace("Z", "").strip()
+    if len(s) >= 19:
+        return s[:19]
+    elif len(s) == 10 and s.count("-") == 2:
+        return s + " 12:00:00"
+    return s
+
 
 # ---------------- БАЗА ДАННЫХ ----------------
 async def init_db():
@@ -151,135 +171,92 @@ async def fetch_month_stats(user_id: int, ym_period: str = None):
             return await cursor.fetchall()
 
 
-# ---------------- РАСШИРЕННЫЙ ПАРСИНГ РЕЗЕРВНОЙ КОПИИ ----------------
+# ---------------- ТОЧНЫЙ ПАРСИНГ ВАШЕЙ БАЗЫ ДАННЫХ ----------------
 def parse_backup_sqlite(sqlite_path):
     conn = sqlite3.connect(sqlite_path)
     cursor = conn.cursor()
 
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-    tables = [r[0] for r in cursor.fetchall()]
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [r[0].lower() for r in cursor.fetchall()]
 
-    # 1. Категории
-    cat_map = {}
-    for tname in tables:
-        if any(w in tname.upper() for w in ["CATEGORY", "CAT", "КАТЕГОР"]):
-            cursor.execute(f"PRAGMA table_info('{tname}');")
-            cols = {c[1].upper(): c[1] for c in cursor.fetchall()}
-            uid_col = cols.get("UID") or cols.get("ID") or cols.get("_ID") or cols.get("Z_PK")
-            name_col = cols.get("NAME") or cols.get("TITLE") or cols.get("CATEGORY_NAME") or cols.get("ZNAME")
-            if uid_col and name_col:
-                try:
-                    cursor.execute(f"SELECT {uid_col}, {name_col} FROM '{tname}';")
-                    for uid, name in cursor.fetchall():
-                        if name:
-                            cat_map[str(uid)] = str(name).strip()
-                except Exception:
-                    pass
-            if cat_map:
-                break
-
-    # 2. Подкатегории
-    subcat_map = {}
-    for tname in tables:
-        if "SUB" in tname.upper():
-            cursor.execute(f"PRAGMA table_info('{tname}');")
-            cols = {c[1].upper(): c[1] for c in cursor.fetchall()}
-            uid_col = cols.get("UID") or cols.get("ID") or cols.get("_ID")
-            name_col = cols.get("NAME") or cols.get("TITLE")
-            if uid_col and name_col:
-                try:
-                    cursor.execute(f"SELECT {uid_col}, {name_col} FROM '{tname}';")
-                    for uid, name in cursor.fetchall():
-                        if name:
-                            subcat_map[str(uid)] = str(name).strip()
-                except Exception:
-                    pass
-            if subcat_map:
-                break
-
-    # 3. Расходы
     expenses = []
-    for tname in tables:
-        cursor.execute(f"PRAGMA table_info('{tname}');")
-        cols = {c[1].upper(): c[1] for c in cursor.fetchall()}
 
-        # Возможные названия сумм
-        money_col = (
-            cols.get("MONEY") or cols.get("AMOUNT") or cols.get("PRICE") or 
-            cols.get("SUM") or cols.get("COST") or cols.get("VALUE") or cols.get("ZAMOUNT")
-        )
-        # Возможные названия дат
-        date_col = (
-            cols.get("DO_DATE") or cols.get("DATE") or cols.get("REG_DATE") or 
-            cols.get("CREATED_AT") or cols.get("DATETIME") or cols.get("TIME") or 
-            cols.get("TIMESTAMP") or cols.get("UTIME") or cols.get("ZDATE")
-        )
-        cat_uid_col = (
-            cols.get("CATEGORY_UID") or cols.get("CATEGORY_ID") or 
-            cols.get("CAT_UID") or cols.get("CATEGORY") or cols.get("ZCATEGORY")
-        )
-        subcat_col = cols.get("SUBCATEGORY_UID") or cols.get("CATEGORY_SUB_UID") or cols.get("SUB_UID")
-        content_col = (
-            cols.get("CONTENT") or cols.get("MEMO") or cols.get("NOTE") or 
-            cols.get("DESCRIPTION") or cols.get("COMMENT") or cols.get("ZNOTE")
-        )
+    # Проверяем точные таблицы из вашей базы
+    if "category" in tables and "transaction" in tables:
+        # 1. Считываем категории
+        cursor.execute("PRAGMA table_info('category');")
+        cat_cols = {c[1].lower(): c[1] for c in cursor.fetchall()}
+        c_uid = cat_cols.get("uid") or "uid"
+        c_title = cat_cols.get("title") or "title"
+        c_type = cat_cols.get("type")
 
-        if money_col and date_col:
-            q_cols = [
-                money_col, 
-                date_col,
-                cat_uid_col if cat_uid_col else "NULL",
-                content_col if content_col else "NULL",
-                subcat_col if subcat_col else "NULL"
-            ]
-            try:
-                cursor.execute(f"SELECT {', '.join(q_cols)} FROM '{tname}';")
-                rows = cursor.fetchall()
-                for r in rows:
-                    amt = r[0]
-                    raw_date = r[1]
-                    cat_val = r[2]
-                    desc_val = r[3] if r[3] else ""
-                    subcat_val = r[4] if len(r) > 4 else None
+        cursor.execute(f"SELECT {c_uid}, {c_title}, {c_type if c_type else '0'} FROM category;")
+        cat_rows = cursor.fetchall()
 
-                    if amt is None:
-                        continue
-                    try:
-                        amt = abs(float(amt))
-                        if amt == 0:
-                            continue
-                    except (ValueError, TypeError):
-                        continue
+        # Автоматически определяем тип расходов (по типичным категориям трат)
+        expense_type = None
+        for uid, title, ctype in cat_rows:
+            t_low = str(title).lower()
+            if any(w in t_low for w in ["продукт", "еда", "транспорт", "кафе", "красот", "аптек", "дом", "связь", "авто", "одежд", "развлеч", "кошк", "food", "transport"]):
+                expense_type = ctype
+                break
 
-                    # Нормализация даты
-                    d_str = str(raw_date).strip()
-                    if len(d_str) == 10 and d_str.count("-") == 2:
-                        d_str += " 12:00:00"
-                    elif len(d_str) > 19:
-                        d_str = d_str[:19]
+        cat_map = {}
+        for uid, title, ctype in cat_rows:
+            if expense_type is not None:
+                if ctype == expense_type:
+                    cat_map[str(uid)] = str(title).strip()
+            else:
+                cat_map[str(uid)] = str(title).strip()
 
-                    # Категория
-                    category_name = "Другое"
-                    if cat_val is not None:
-                        s_cat = str(cat_val).strip()
-                        if s_cat in cat_map:
-                            category_name = cat_map[s_cat]
-                        elif not s_cat.isdigit() and len(s_cat) > 1:
-                            category_name = s_cat
+        # 2. Считываем транзакции
+        cursor.execute("PRAGMA table_info('transaction');")
+        tx_cols = {c[1].lower(): c[1] for c in cursor.fetchall()}
 
-                    desc_parts = []
-                    if subcat_val is not None and str(subcat_val).strip() in subcat_map:
-                        desc_parts.append(subcat_map[str(subcat_val).strip()])
-                    if desc_val and str(desc_val).strip():
-                        desc_parts.append(str(desc_val).strip())
+        amt_col = tx_cols.get("amountindefaultcurrency") or tx_cols.get("amountinaccountcurrency") or tx_cols.get("amountinrealcurrency") or "amountInDefaultCurrency"
+        date_col = tx_cols.get("created") or "created"
+        cat_col = next((tx_cols[c] for c in tx_cols if "cat" in c), "categoryUid")
+        note_col = next((tx_cols[c] for c in tx_cols if c in ["note", "comment", "description", "memo"]), None)
+        rem_col = next((tx_cols[c] for c in tx_cols if "remove" in c or "delete" in c), None)
 
-                    desc = " — ".join(desc_parts)
-                    expenses.append((category_name, amt, desc, d_str))
+        q_cols = [amt_col, date_col, cat_col if cat_col in tx_cols.values() else "NULL"]
+        q_cols.append(note_col if note_col else "NULL")
+        q_cols.append(rem_col if rem_col else "NULL")
 
-                if len(expenses) > 0:
-                    break
-            except Exception:
+        cursor.execute(f"SELECT {', '.join(q_cols)} FROM 'transaction';")
+        for r in cursor.fetchall():
+            raw_amt = r[0]
+            raw_date = r[1]
+            raw_cat = r[2]
+            raw_note = r[3]
+            is_removed = r[4]
+
+            # Игнорируем удаленные записи
+            if is_removed in [1, "1", True, "true"]:
                 continue
+
+            if raw_amt is None:
+                continue
+
+            try:
+                amt = abs(float(raw_amt))
+                if amt == 0:
+                    continue
+            except (ValueError, TypeError):
+                continue
+
+            cat_uid_str = str(raw_cat).strip() if raw_cat is not None else ""
+            if cat_map:
+                if cat_uid_str not in cat_map:
+                    continue
+                category_name = cat_map[cat_uid_str]
+            else:
+                category_name = "Другое"
+
+            dt_str = parse_created_date(raw_date)
+            desc = str(raw_note).strip() if raw_note else ""
+
+            expenses.append((category_name, amt, desc, dt_str))
 
     conn.close()
     return expenses
@@ -330,15 +307,15 @@ async def cmd_start(message: types.Message):
     await ensure_default_categories(message.from_user.id)
     text = (
         "👋 Привет! Я твой бот учета финансов с умной аналитикой товаров.\n\n"
-        "💡 **Как вносить траты:**\n"
-        "• С названием товара: `420 шампунь` или `890 корм` ➔ выбери категорию.\n"
-        "• Или просто сумму: `350` ➔ название товара можно задать в любой момент!\n\n"
-        "📈 **Аналитика повторов:** объединяет траты по названию товара независимо от цены.\n\n"
-        "📁 **Импорт истории:** отправьте сюда файл архива (`.zip` или `.mmbackup`)."
+        "💡 **Как пользоваться:**\n"
+        "• **Внести расход:** напиши сумму с названием товара или без (например, `420 шампунь` или `300`).\n"
+        "• **📊 Текущий месяц / 📅 Выбрать месяц:** статистика за текущий или любой прошлый месяц.\n"
+        "• **📂 Мои категории:** детальный просмотр трат, редактирование и умная аналитика.\n\n"
+        "📁 **Импорт:** отправьте в чат ваш файл архива (`.zip` или `.mmbackup`)."
     )
     await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
-# ОБРАБОТЧИК ФАЙЛА С АВТОДИАГНОСТИКОЙ
+# Загрузка и импорт резервной копии
 @dp.message(F.document)
 async def handle_backup_document(message: types.Message):
     doc = message.document
@@ -348,7 +325,7 @@ async def handle_backup_document(message: types.Message):
         await message.answer("Пожалуйста, отправьте файл резервной копии (`.zip` или `.mmbackup`).")
         return
 
-    status_msg = await message.answer("⏳ Анализирую файл базы данных...")
+    status_msg = await message.answer("⏳ Распаковываю и переношу историю ваших трат...")
     user_id = message.from_user.id
     temp_dir = tempfile.mkdtemp()
 
@@ -375,34 +352,15 @@ async def handle_backup_document(message: types.Message):
                 pass
 
         if not extracted_db or not os.path.exists(extracted_db):
-            await status_msg.edit_text("❌ В архиве не найден файл базы данных `.sqlite`.")
+            await status_msg.edit_text("❌ В архиве не найден файл базы данных.")
             return
 
-        # Пробуем распарсить
         expenses = parse_backup_sqlite(extracted_db)
 
-        # Если не получилось — выводим диагностику колонок пользователю!
         if not expenses:
-            conn = sqlite3.connect(extracted_db)
-            c = conn.cursor()
-            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-            tbls = [r[0] for r in c.fetchall()]
-            diag_lines = []
-            for t in tbls[:5]:
-                c.execute(f"PRAGMA table_info('{t}');")
-                cols_list = [col[1] for col in c.fetchall()]
-                diag_lines.append(f"📁 **{t}**:\n`{', '.join(cols_list[:8])}`")
-            conn.close()
-
-            diag_text = "\n\n".join(diag_lines)
-            await status_msg.edit_text(
-                f"⚠️ **Не удалось найти расходы автоматически.**\n\n"
-                f"Вот таблицы внутри вашей базы:\n\n{diag_text}\n\n"
-                f"👉 **Скопируйте этот текст в наш диалог**, и мы сразу подставим ваши точные колонки!"
-            )
+            await status_msg.edit_text("❌ В базе не удалось найти расходы.")
             return
 
-        # Если получилось — переносим в базу
         await ensure_default_categories(user_id)
         existing_cats = {name.lower(): name for _, name in await get_user_categories(user_id)}
         imported_cats = set(e[0] for e in expenses)
@@ -431,7 +389,7 @@ async def handle_backup_document(message: types.Message):
             f"• Категорий: **{len(imported_cats)}**\n"
             f"• Общая сумма: **{total_sum:.2f} руб.**\n"
             f"• Период: **{date_range}**\n\n"
-            f"Вся история распределена по месяцам! Проверьте **📊 Текущий месяц** и **📅 Выбрать месяц**."
+            f"Все данные распределены по месяцам и категориям! Нажмите **📊 Текущий месяц** или **📅 Выбрать месяц**."
         )
         await status_msg.edit_text(report_text, parse_mode="Markdown")
 
@@ -768,342 +726,4 @@ async def callback_confirm_del_cat(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT name FROM categories WHERE id = ? AND user_id = ?", (cat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            cat_name = row[0] if row else ""
-
-        if cat_name:
-            await db.execute("DELETE FROM categories WHERE id = ? AND user_id = ?", (cat_id, user_id))
-            await db.execute("DELETE FROM expenses WHERE category_name = ? AND user_id = ?", (cat_name, user_id))
-            await db.commit()
-
-    buttons = [[InlineKeyboardButton(text="◀️ Ко всем категориям", callback_data="b_cats")]]
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text(f"🗑️ Категория **«{cat_name}»** удалена.", reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("exp_"))
-async def callback_expense_details(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    _, exp_id, cat_id = callback.data.split("_")
-    exp_id = int(exp_id)
-    cat_id = int(cat_id)
-    user_id = callback.from_user.id
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT category_name, amount, description, created_at FROM expenses WHERE id = ? AND user_id = ?", 
-            (exp_id, user_id)
-        ) as cursor:
-            exp = await cursor.fetchone()
-
-    if not exp:
-        await callback.message.edit_text("Расход не найден.")
-        return
-
-    cat_name, amount, desc, created_at = exp
-    date_formatted = format_datetime(created_at)
-    desc_text = f"• Товар/услуга: **{desc}**\n" if desc else "• Товар/услуга: *не указано*\n"
-
-    text = (
-        f"🧾 **Детали расхода:**\n\n"
-        f"• Категория: **{cat_name}**\n"
-        f"• Сумма: **{amount:.2f} руб.**\n"
-        f"{desc_text}"
-        f"• Дата: **{date_formatted}**\n\n"
-        f"Выберите действие:"
-    )
-
-    buttons = [
-        [
-            InlineKeyboardButton(text="✏️ Изменить сумму", callback_data=f"edit_{exp_id}_{cat_id}"),
-            InlineKeyboardButton(text="🏷 Задать название", callback_data=f"tag_{exp_id}_{cat_id}")
-        ],
-        [
-            InlineKeyboardButton(text="📈 Аналитика этого товара", callback_data=f"anl_{exp_id}_{cat_id}_ov"),
-            InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"del_{exp_id}_{cat_id}")
-        ],
-        [InlineKeyboardButton(text="◀️ Назад к списку", callback_data=f"vcat_{cat_id}")]
-    ]
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("tag_"))
-async def callback_tag_expense(callback: types.CallbackQuery, state: FSMContext):
-    _, exp_id, cat_id = callback.data.split("_")
-    await state.update_data(exp_id=int(exp_id), cat_id=int(cat_id))
-    await state.set_state(Form.waiting_for_expense_desc)
-
-    buttons = [[InlineKeyboardButton(text="❌ Отмена", callback_data=f"exp_{exp_id}_{cat_id}")]]
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text(
-        "Введите название товара или услуги (например, `шампунь` или `корм`):",
-        reply_markup=keyboard
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("del_"))
-async def callback_delete_expense(callback: types.CallbackQuery):
-    _, exp_id, cat_id = callback.data.split("_")
-    exp_id = int(exp_id)
-    cat_id = int(cat_id)
-    user_id = callback.from_user.id
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM expenses WHERE id = ? AND user_id = ?", (exp_id, user_id))
-        await db.commit()
-
-    buttons = [[InlineKeyboardButton(text="◀️ Вернуться к расходам", callback_data=f"vcat_{cat_id}")]]
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text("🗑️ **Расход удален!**", reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("edit_"))
-async def callback_edit_expense(callback: types.CallbackQuery, state: FSMContext):
-    _, exp_id, cat_id = callback.data.split("_")
-    await state.update_data(exp_id=int(exp_id), cat_id=int(cat_id))
-    await state.set_state(Form.waiting_for_new_amount)
-
-    buttons = [[InlineKeyboardButton(text="❌ Отмена", callback_data=f"exp_{exp_id}_{cat_id}")]]
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text("Введите новую сумму для этого расхода:", reply_markup=keyboard)
-    await callback.answer()
-
-async def get_matching_expenses(user_id: int, exp_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT category_name, amount, description FROM expenses WHERE id = ? AND user_id = ?", 
-            (exp_id, user_id)
-        ) as cursor:
-            target = await cursor.fetchone()
-
-        if not target:
-            return None, []
-
-        cat_name, amount, desc = target
-
-        if desc and len(desc.strip()) > 0:
-            clean_word = desc.strip()
-            query = """
-                SELECT id, amount, description, created_at 
-                FROM expenses 
-                WHERE user_id = ? AND category_name = ? 
-                  AND LOWER(description) LIKE LOWER(?)
-                ORDER BY created_at DESC
-            """
-            params = (user_id, cat_name, f"%{clean_word}%")
-        else:
-            query = """
-                SELECT id, amount, description, created_at 
-                FROM expenses 
-                WHERE user_id = ? AND category_name = ? AND amount = ?
-                ORDER BY created_at DESC
-            """
-            params = (user_id, cat_name, amount)
-
-        async with db.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
-            return target, rows
-
-@dp.callback_query(F.data.startswith("anl_"))
-async def callback_expense_analytics(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    exp_id = int(parts[1])
-    cat_id = int(parts[2])
-    view_type = parts[3]
-    user_id = callback.from_user.id
-
-    target, matching_rows = await get_matching_expenses(user_id, exp_id)
-    if not target:
-        await callback.message.edit_text("Расход не найден.")
-        await callback.answer()
-        return
-
-    cat_name, target_amount, target_desc = target
-    has_tag = bool(target_desc and len(target_desc.strip()) > 0)
-    item_title = f"«{target_desc}»" if has_tag else f"{target_amount:.2f} руб."
-
-    now = datetime.datetime.utcnow()
-    parsed_items = []
-    for mid, m_amount, m_desc, m_created_at in matching_rows:
-        try:
-            dt = datetime.datetime.strptime(m_created_at, "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            dt = now
-        parsed_items.append((dt, m_amount, m_created_at, m_desc))
-
-    def count_in_days(days: int):
-        filtered = [x for x in parsed_items if (now - x[0]).total_seconds() <= days * 86400]
-        return len(filtered), sum(x[1] for x in filtered)
-
-    if view_type == "ov":
-        w_cnt, w_sum = count_in_days(7)
-        m1_cnt, m1_sum = count_in_days(30)
-        m2_cnt, m2_sum = count_in_days(60)
-        m3_cnt, m3_sum = count_in_days(90)
-        y1_cnt, y1_sum = count_in_days(365)
-        all_cnt = len(parsed_items)
-        all_sum = sum(x[1] for x in parsed_items)
-
-        all_amounts = [x[1] for x in parsed_items]
-        avg_price = (all_sum / all_cnt) if all_cnt > 0 else 0
-        min_p = min(all_amounts) if all_amounts else 0
-        max_p = max(all_amounts) if all_amounts else 0
-
-        price_spread = f"• Разброс цен: **от {min_p:.2f} до {max_p:.2f} руб.**\n" if min_p != max_p else ""
-
-        monthly_stats = {}
-        for dt, amt, _, _ in parsed_items:
-            ym = dt.strftime("%Y-%m")
-            if ym not in monthly_stats:
-                monthly_stats[ym] = [0, 0.0]
-            monthly_stats[ym][0] += 1
-            monthly_stats[ym][1] += amt
-
-        months_report = []
-        for ym in sorted(monthly_stats.keys(), reverse=True)[:6]:
-            m_title = get_month_title(ym)
-            cnt, sm = monthly_stats[ym]
-            months_report.append(f"• **{m_title}**: {cnt} раз(а) — {sm:.2f} руб.")
-
-        months_text = "\n".join(months_report) if months_report else "• Пока нет данных"
-
-        avg_text = ""
-        if len(parsed_items) >= 2:
-            oldest_dt = min(x[0] for x in parsed_items)
-            newest_dt = max(x[0] for x in parsed_items)
-            span_days = (newest_dt - oldest_dt).days
-            if span_days > 0:
-                avg_interval = span_days / (len(parsed_items) - 1)
-                avg_text = f"💡 *В среднем покупаете раз в ~{round(avg_interval)} дн.*\n"
-
-        tip_text = ""
-        if not has_tag:
-            tip_text = (
-                "\n⚠️ *У этой траты не задано название товара.*\n"
-                "Анализ построен по точной сумме. Нажмите «🏷 Задать название» в карточке, чтобы бот объединил её с покупками по другим ценам!\n"
-            )
-
-        text = (
-            f"📈 **Аналитика товара: {item_title}**\n"
-            f"📂 Категория: **{cat_name}**\n\n"
-            f"💰 **Общие показатели:**\n"
-            f"• Всего куплено: **{all_cnt} раз(а)**\n"
-            f"• Общая сумма: **{all_sum:.2f} руб.**\n"
-            f"• Средняя цена: **{avg_price:.2f} руб.**\n"
-            f"{price_spread}"
-            f"{avg_text}"
-            f"{tip_text}\n"
-            f"⏱ **Частота по периодам:**\n"
-            f"• 7 дней (неделя): **{w_cnt}** раз — {w_sum:.2f} руб.\n"
-            f"• 30 дней (1 мес.): **{m1_cnt}** раз — {m1_sum:.2f} руб.\n"
-            f"• 60 дней (2 мес.): **{m2_cnt}** раз — {m2_sum:.2f} руб.\n"
-            f"• 90 дней (3 мес.): **{m3_cnt}** раз — {m3_sum:.2f} руб.\n"
-            f"• 1 год (365 дн.): **{y1_cnt}** раз — {y1_sum:.2f} руб.\n\n"
-            f"📅 **По месяцам:**\n{months_text}\n\n"
-            f"👇 *Нажмите на период, чтобы посмотреть список чеков:* "
-        )
-
-        buttons = [
-            [
-                InlineKeyboardButton(text="7 дн.", callback_data=f"anl_{exp_id}_{cat_id}_7"),
-                InlineKeyboardButton(text="30 дн.", callback_data=f"anl_{exp_id}_{cat_id}_30"),
-                InlineKeyboardButton(text="60 дн.", callback_data=f"anl_{exp_id}_{cat_id}_60")
-            ],
-            [
-                InlineKeyboardButton(text="90 дн.", callback_data=f"anl_{exp_id}_{cat_id}_90"),
-                InlineKeyboardButton(text="1 год", callback_data=f"anl_{exp_id}_{cat_id}_365"),
-                InlineKeyboardButton(text="♾ Всё", callback_data=f"anl_{exp_id}_{cat_id}_all")
-            ],
-            [InlineKeyboardButton(text="◀️ Назад к расходу", callback_data=f"exp_{exp_id}_{cat_id}")]
-        ]
-        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-        await callback.answer()
-        return
-
-    days_labels = {
-        "7": "7 дней (неделя)",
-        "30": "30 дней (1 месяц)",
-        "60": "60 дней (2 месяца)",
-        "90": "90 дней (3 месяца)",
-        "365": "1 год (365 дней)",
-        "all": "Всё время"
-    }
-    period_name = days_labels.get(view_type, view_type)
-
-    if view_type == "all":
-        selected_items = parsed_items
-    else:
-        limit_days = int(view_type)
-        selected_items = [x for x in parsed_items if (now - x[0]).total_seconds() <= limit_days * 86400]
-
-    count_period = len(selected_items)
-    sum_period = sum(x[1] for x in selected_items)
-
-    dates_lines = []
-    for idx, (_, amt, raw_dt, d_text) in enumerate(selected_items[:12], 1):
-        f_dt = format_datetime(raw_dt)
-        note = f" ({d_text})" if d_text else ""
-        dates_lines.append(f"{idx}. {f_dt} — **{amt:.2f} руб.**{note}")
-
-    dates_block = "\n".join(dates_lines) if dates_lines else "Покупок за этот период не было."
-    if len(selected_items) > 12:
-        dates_block += f"\n*...и еще {len(selected_items) - 12} покупок*"
-
-    detail_text = (
-        f"🔍 **Детально за период: {period_name}**\n\n"
-        f"📌 Товар: **{item_title}**\n"
-        f"📂 Категория: **{cat_name}**\n\n"
-        f"• Количество покупок: **{count_period}**\n"
-        f"• Общая сумма: **{sum_period:.2f} руб.**\n\n"
-        f"📜 **История покупок:**\n{dates_block}"
-    )
-
-    buttons = [
-        [
-            InlineKeyboardButton(text="7 дн.", callback_data=f"anl_{exp_id}_{cat_id}_7"),
-            InlineKeyboardButton(text="30 дн.", callback_data=f"anl_{exp_id}_{cat_id}_30"),
-            InlineKeyboardButton(text="60 дн.", callback_data=f"anl_{exp_id}_{cat_id}_60")
-        ],
-        [
-            InlineKeyboardButton(text="90 дн.", callback_data=f"anl_{exp_id}_{cat_id}_90"),
-            InlineKeyboardButton(text="1 год", callback_data=f"anl_{exp_id}_{cat_id}_365"),
-            InlineKeyboardButton(text="♾ Всё", callback_data=f"anl_{exp_id}_{cat_id}_all")
-        ],
-        [InlineKeyboardButton(text="📊 К общему обзору", callback_data=f"anl_{exp_id}_{cat_id}_ov")],
-        [InlineKeyboardButton(text="◀️ К расходу", callback_data=f"exp_{exp_id}_{cat_id}")]
-    ]
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text(detail_text, reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data == "cancel")
-async def callback_cancel(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("Отменено.")
-    await callback.answer()
-
-async def handle_ping(request):
-    return web.Response(text="Bot is running!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    port = int(os.getenv("PORT", 8080))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-async def main():
-    await init_db()
-    await start_web_server()
-    print(">>> Бот запущен на Render! <<<")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-if __name__ == "__main__":
-    asyncio.run(main())
+        async with db.execute("SELECT
