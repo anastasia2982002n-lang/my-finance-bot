@@ -16,31 +16,22 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-# Токен берется из настроек сервера Render
+# Токен берется из настроек сервера или вставляется сюда
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8594928547:AAEBswHuJYtFWwjKSUAhb4Jx_LFyOmIEJ4M")
 DB_NAME = "finance_bot.db"
 
 logging.basicConfig(level=logging.INFO)
 
+# Категории по умолчанию с красивыми иконками
 DEFAULT_CATEGORIES = [
-    "Продукты",
-    "Транспорт",
-    "Красота",
-    "Кафе",
-    "Развлечения",
-    "Кошка",
-    "Одежда",
+    "🛒 Продукты",
+    "🚕 Транспорт",
+    "💅 Красота",
+    "☕ Кафе",
+    "🎬 Развлечения",
+    "🐱 Кошка",
+    "👗 Одежда",
 ]
-
-KEYWORD_MAPPING = {
-    "Кошка": ["кошк", "кот", "корм", "ветеринар", "наполнитель", "вискас"],
-    "Продукты": ["продукт", "еда", "пятерочк", "магнит", "хлеб", "молок", "мясо", "перекресток"],
-    "Транспорт": ["такси", "метро", "автобус", "бензин", "проезд", "заправк", "uber", "яндекс"],
-    "Кафе": ["кафе", "ресторан", "кофе", "пицц", "бургер", "макдон", "обед", "ланч"],
-    "Красота": ["стрижк", "маникюр", "ногти", "косметик", "парикмахер", "барбер", "бров"],
-    "Развлечения": ["кино", "театр", "концерт", "игр", "книг", "боулинг", "подписк"],
-    "Одежда": ["одежд", "кроссовк", "куртк", "джинс", "обувь", "футболк", "zara"],
-}
 
 class Form(StatesGroup):
     waiting_for_category_name = State()
@@ -88,6 +79,7 @@ async def add_expense(user_id: int, category_name: str, amount: float, descripti
         )
         await db.commit()
 
+# Постоянное меню внизу
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -97,10 +89,19 @@ def get_main_keyboard():
         resize_keyboard=True
     )
 
+# Удобная раскладка кнопок категорий в 2 колонки
 def build_categories_inline_keyboard(categories, amount: float):
     buttons = []
+    row = []
     for cat_id, name in categories:
-        buttons.append([InlineKeyboardButton(text=name, callback_data=f"add_{cat_id}_{amount}")])
+        row.append(InlineKeyboardButton(text=name, callback_data=f"add_{cat_id}_{amount}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    
+    # Кнопка отмены в самом низу
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -111,11 +112,11 @@ dp = Dispatcher(storage=MemoryStorage())
 async def cmd_start(message: types.Message):
     await ensure_default_categories(message.from_user.id)
     text = (
-        "👋 Привет! Я бот для учета финансов.\n\n"
-        "💡 **Как вносить расходы:**\n"
-        "• Число: `200` — выберите категорию кнопкой.\n"
-        "• Текст: `200 рублей на корм кошке` или `500 такси` — определю сам!\n\n"
-        "Внизу есть кнопки для статистики и добавления категорий."
+        "👋 Привет! Я твой бот учета расходов.\n\n"
+        "💡 **Как пользоваться:**\n"
+        "Просто напиши любую сумму (например: `250`, `500`, `1200`), "
+        "и я сразу покажу кнопки со всеми твоими категориями!\n\n"
+        "Используй кнопки внизу для просмотра статистики и создания новых категорий."
     )
     await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
@@ -130,7 +131,7 @@ async def show_stats(message: types.Message):
             rows = await cursor.fetchall()
 
     if not rows:
-        await message.answer("У вас пока нет записанных расходов.")
+        await message.answer("У вас пока нет записанных расходов. Напишите сумму, чтобы добавить первый!")
         return
 
     total = sum(row[1] for row in rows)
@@ -139,7 +140,7 @@ async def show_stats(message: types.Message):
         percent = (sum_amount / total) * 100
         report.append(f"• **{cat_name}**: {sum_amount:.2f} руб. ({percent:.1f}%)")
 
-    report.append(f"\n💰 **Итого расходов:** {total:.2f} руб.")
+    report.append(f"\n💰 **Всего потрачено:** {total:.2f} руб.")
     await message.answer("\n".join(report), parse_mode="Markdown")
 
 @dp.message(F.text == "📂 Мои категории")
@@ -151,12 +152,12 @@ async def list_categories(message: types.Message):
 
 @dp.message(F.text == "➕ Добавить категорию")
 async def start_add_category(message: types.Message, state: FSMContext):
-    await message.answer("Введите название новой категории:")
+    await message.answer("Введите название новой категории (можно сразу добавить смайлик):")
     await state.set_state(Form.waiting_for_category_name)
 
 @dp.message(Form.waiting_for_category_name)
 async def process_category_name(message: types.Message, state: FSMContext):
-    cat_name = message.text.strip().capitalize()
+    cat_name = message.text.strip()
     user_id = message.from_user.id
 
     async with aiosqlite.connect(DB_NAME) as db:
@@ -164,16 +165,18 @@ async def process_category_name(message: types.Message, state: FSMContext):
         await db.commit()
 
     await state.clear()
-    await message.answer(f"✅ Категория **«{cat_name}»** добавлена!", reply_markup=get_main_keyboard(), parse_mode="Markdown")
+    await message.answer(f"✅ Категория **«{cat_name}»** успешно добавлена в ваши кнопки!", reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
+# Любое сообщение с числом вызывает удобные кнопки категорий
 @dp.message(F.text)
 async def handle_expense_input(message: types.Message):
     user_id = message.from_user.id
-    text = message.text.lower()
+    text = message.text
 
+    # Поиск числа
     match = re.search(r'(\d+(?:[.,]\d+)?)', text)
     if not match:
-        await message.answer("Укажите сумму, например: `300` или `300 кафе`.", parse_mode="Markdown")
+        await message.answer("Напишите сумму расхода (например, `350`), и я предложу выбрать категорию кнопкой.", parse_mode="Markdown")
         return
 
     amount_str = match.group(1).replace(",", ".")
@@ -185,33 +188,10 @@ async def handle_expense_input(message: types.Message):
     await ensure_default_categories(user_id)
     categories = await get_user_categories(user_id)
 
-    remainder = re.sub(r'(\d+(?:[.,]\d+)?)', '', text)
-    remainder = re.sub(r'\b(руб|рубл|рублей|р)\b', '', remainder).strip()
+    keyboard = build_categories_inline_keyboard(categories, amount)
+    await message.answer(f"Куда отнести **{amount:.2f} руб.**?", reply_markup=keyboard, parse_mode="Markdown")
 
-    matched_category = None
-    if remainder:
-        for cat_name, keywords in KEYWORD_MAPPING.items():
-            for kw in keywords:
-                if kw in remainder:
-                    if any(c[1].lower() == cat_name.lower() for c in categories):
-                        matched_category = cat_name
-                        break
-            if matched_category:
-                break
-
-        if not matched_category:
-            for _, cat_name in categories:
-                if cat_name.lower() in remainder:
-                    matched_category = cat_name
-                    break
-
-    if matched_category:
-        await add_expense(user_id, matched_category, amount, description=message.text)
-        await message.answer(f"✅ Записано: **{amount:.2f} руб.** в категорию **«{matched_category}»**", parse_mode="Markdown")
-    else:
-        keyboard = build_categories_inline_keyboard(categories, amount)
-        await message.answer(f"Куда отнести **{amount:.2f} руб.**?", reply_markup=keyboard, parse_mode="Markdown")
-
+# Нажатие на кнопку категории
 @dp.callback_query(F.data.startswith("add_"))
 async def callback_add_expense(callback: types.CallbackQuery):
     _, cat_id, amount = callback.data.split("_")
@@ -228,7 +208,7 @@ async def callback_add_expense(callback: types.CallbackQuery):
             category_name = row[0]
 
     await add_expense(user_id, category_name, amount)
-    await callback.message.edit_text(f"✅ Записано: **{amount:.2f} руб.** в категорию **«{category_name}»**", parse_mode="Markdown")
+    await callback.message.edit_text(f"✅ Записано: **{amount:.2f} руб.** в категорию **{category_name}**", parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(F.data == "cancel")
@@ -236,7 +216,7 @@ async def callback_cancel(callback: types.CallbackQuery):
     await callback.message.edit_text("Отменено.")
     await callback.answer()
 
-# Простой веб-сервер для Render
+# Веб-сервер для поддержки активности Render
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
 
@@ -254,6 +234,9 @@ async def main():
     await start_web_server()
     print(">>> Бот запущен на Render! <<<")
     await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 if __name__ == "__main__":
     asyncio.run(main())
