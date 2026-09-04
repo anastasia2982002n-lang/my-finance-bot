@@ -45,10 +45,10 @@ MONTH_NAMES = {
 PENDING_EXPENSES = {}
 
 class Form(StatesGroup):
-    waiting_for_category_name = State()   # Создание категории
-    waiting_for_new_cat_name = State()    # Переименование категории
-    waiting_for_new_amount = State()      # Редактирование суммы
-    waiting_for_expense_desc = State()    # Задание названия товара/тега
+    waiting_for_category_name = State()
+    waiting_for_new_cat_name = State()
+    waiting_for_new_amount = State()
+    waiting_for_expense_desc = State()
 
 def format_datetime(dt_str: str) -> str:
     try:
@@ -151,22 +151,22 @@ async def fetch_month_stats(user_id: int, ym_period: str = None):
             return await cursor.fetchall()
 
 
-# ---------------- УМНЫЙ ПАРСИНГ РЕЗЕРВНОЙ КОПИИ ----------------
+# ---------------- РАСШИРЕННЫЙ ПАРСИНГ РЕЗЕРВНОЙ КОПИИ ----------------
 def parse_backup_sqlite(sqlite_path):
     conn = sqlite3.connect(sqlite_path)
     cursor = conn.cursor()
 
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
     tables = [r[0] for r in cursor.fetchall()]
 
     # 1. Категории
     cat_map = {}
     for tname in tables:
-        if "CATEGORY" in tname.upper() and "SUB" not in tname.upper():
+        if any(w in tname.upper() for w in ["CATEGORY", "CAT", "КАТЕГОР"]):
             cursor.execute(f"PRAGMA table_info('{tname}');")
             cols = {c[1].upper(): c[1] for c in cursor.fetchall()}
             uid_col = cols.get("UID") or cols.get("ID") or cols.get("_ID") or cols.get("Z_PK")
-            name_col = cols.get("NAME") or cols.get("TITLE") or cols.get("CATEGORY_NAME")
+            name_col = cols.get("NAME") or cols.get("TITLE") or cols.get("CATEGORY_NAME") or cols.get("ZNAME")
             if uid_col and name_col:
                 try:
                     cursor.execute(f"SELECT {uid_col}, {name_col} FROM '{tname}';")
@@ -178,10 +178,10 @@ def parse_backup_sqlite(sqlite_path):
             if cat_map:
                 break
 
-    # 2. Подкатегории (если есть в приложении)
+    # 2. Подкатегории
     subcat_map = {}
     for tname in tables:
-        if "SUB" in tname.upper() and "CAT" in tname.upper():
+        if "SUB" in tname.upper():
             cursor.execute(f"PRAGMA table_info('{tname}');")
             cols = {c[1].upper(): c[1] for c in cursor.fetchall()}
             uid_col = cols.get("UID") or cols.get("ID") or cols.get("_ID")
@@ -203,12 +203,26 @@ def parse_backup_sqlite(sqlite_path):
         cursor.execute(f"PRAGMA table_info('{tname}');")
         cols = {c[1].upper(): c[1] for c in cursor.fetchall()}
 
-        money_col = cols.get("MONEY") or cols.get("AMOUNT") or cols.get("PRICE")
-        date_col = cols.get("DO_DATE") or cols.get("DATE") or cols.get("REG_DATE") or cols.get("CREATED_AT")
-        cat_uid_col = cols.get("CATEGORY_UID") or cols.get("CATEGORY_ID") or cols.get("CAT_UID") or cols.get("CATEGORY")
+        # Возможные названия сумм
+        money_col = (
+            cols.get("MONEY") or cols.get("AMOUNT") or cols.get("PRICE") or 
+            cols.get("SUM") or cols.get("COST") or cols.get("VALUE") or cols.get("ZAMOUNT")
+        )
+        # Возможные названия дат
+        date_col = (
+            cols.get("DO_DATE") or cols.get("DATE") or cols.get("REG_DATE") or 
+            cols.get("CREATED_AT") or cols.get("DATETIME") or cols.get("TIME") or 
+            cols.get("TIMESTAMP") or cols.get("UTIME") or cols.get("ZDATE")
+        )
+        cat_uid_col = (
+            cols.get("CATEGORY_UID") or cols.get("CATEGORY_ID") or 
+            cols.get("CAT_UID") or cols.get("CATEGORY") or cols.get("ZCATEGORY")
+        )
         subcat_col = cols.get("SUBCATEGORY_UID") or cols.get("CATEGORY_SUB_UID") or cols.get("SUB_UID")
-        pay_type_col = cols.get("PAY_TYPE") or cols.get("INOUT_TYPE") or cols.get("TYPE") or cols.get("INOUT")
-        content_col = cols.get("CONTENT") or cols.get("MEMO") or cols.get("NOTE") or cols.get("DESCRIPTION")
+        content_col = (
+            cols.get("CONTENT") or cols.get("MEMO") or cols.get("NOTE") or 
+            cols.get("DESCRIPTION") or cols.get("COMMENT") or cols.get("ZNOTE")
+        )
 
         if money_col and date_col:
             q_cols = [
@@ -216,7 +230,6 @@ def parse_backup_sqlite(sqlite_path):
                 date_col,
                 cat_uid_col if cat_uid_col else "NULL",
                 content_col if content_col else "NULL",
-                pay_type_col if pay_type_col else "NULL",
                 subcat_col if subcat_col else "NULL"
             ]
             try:
@@ -227,13 +240,10 @@ def parse_backup_sqlite(sqlite_path):
                     raw_date = r[1]
                     cat_val = r[2]
                     desc_val = r[3] if r[3] else ""
-                    ptype = r[4]
-                    subcat_val = r[5] if len(r) > 5 else None
+                    subcat_val = r[4] if len(r) > 4 else None
 
-                    # Пропускаем доходы и переводы
-                    if ptype is not None and str(ptype).strip() in ['1', '2', 'INC', 'INCOME', 'TRANSFER']:
+                    if amt is None:
                         continue
-
                     try:
                         amt = abs(float(amt))
                         if amt == 0:
@@ -241,12 +251,14 @@ def parse_backup_sqlite(sqlite_path):
                     except (ValueError, TypeError):
                         continue
 
+                    # Нормализация даты
                     d_str = str(raw_date).strip()
                     if len(d_str) == 10 and d_str.count("-") == 2:
                         d_str += " 12:00:00"
                     elif len(d_str) > 19:
                         d_str = d_str[:19]
 
+                    # Категория
                     category_name = "Другое"
                     if cat_val is not None:
                         s_cat = str(cat_val).strip()
@@ -255,7 +267,6 @@ def parse_backup_sqlite(sqlite_path):
                         elif not s_cat.isdigit() and len(s_cat) > 1:
                             category_name = s_cat
 
-                    # Формируем описание товара из подкатегории и заметки
                     desc_parts = []
                     if subcat_val is not None and str(subcat_val).strip() in subcat_map:
                         desc_parts.append(subcat_map[str(subcat_val).strip()])
@@ -265,7 +276,7 @@ def parse_backup_sqlite(sqlite_path):
                     desc = " — ".join(desc_parts)
                     expenses.append((category_name, amt, desc, d_str))
 
-                if expenses:
+                if len(expenses) > 0:
                     break
             except Exception:
                 continue
@@ -322,22 +333,22 @@ async def cmd_start(message: types.Message):
         "💡 **Как вносить траты:**\n"
         "• С названием товара: `420 шампунь` или `890 корм` ➔ выбери категорию.\n"
         "• Или просто сумму: `350` ➔ название товара можно задать в любой момент!\n\n"
-        "📈 **Аналитика повторов:** объединяет траты по названию товара независимо от цены (даже если шампунь стоил сначала 350, а потом 420 руб.).\n\n"
-        "📁 **Импорт истории:** отправьте сюда файл резервной копии (`.zip` или `.mmbackup`)."
+        "📈 **Аналитика повторов:** объединяет траты по названию товара независимо от цены.\n\n"
+        "📁 **Импорт истории:** отправьте сюда файл архива (`.zip` или `.mmbackup`)."
     )
     await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
-# Импорт бэкапа
+# ОБРАБОТЧИК ФАЙЛА С АВТОДИАГНОСТИКОЙ
 @dp.message(F.document)
 async def handle_backup_document(message: types.Message):
     doc = message.document
     fname = doc.file_name.lower()
 
     if not (fname.endswith(".zip") or fname.endswith(".mmbackup") or fname.endswith(".sqlite") or fname.endswith(".db")):
-        await message.answer("Пожалуйста, отправьте файл резервной копии (с расширением `.zip` или `.mmbackup`).")
+        await message.answer("Пожалуйста, отправьте файл резервной копии (`.zip` или `.mmbackup`).")
         return
 
-    status_msg = await message.answer("⏳ Получил файл! Распаковываю и переношу историю...")
+    status_msg = await message.answer("⏳ Анализирую файл базы данных...")
     user_id = message.from_user.id
     temp_dir = tempfile.mkdtemp()
 
@@ -364,14 +375,34 @@ async def handle_backup_document(message: types.Message):
                 pass
 
         if not extracted_db or not os.path.exists(extracted_db):
-            await status_msg.edit_text("❌ В архиве не найден файл базы данных.")
+            await status_msg.edit_text("❌ В архиве не найден файл базы данных `.sqlite`.")
             return
 
+        # Пробуем распарсить
         expenses = parse_backup_sqlite(extracted_db)
+
+        # Если не получилось — выводим диагностику колонок пользователю!
         if not expenses:
-            await status_msg.edit_text("❌ В базе не найдено записей о расходах.")
+            conn = sqlite3.connect(extracted_db)
+            c = conn.cursor()
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+            tbls = [r[0] for r in c.fetchall()]
+            diag_lines = []
+            for t in tbls[:5]:
+                c.execute(f"PRAGMA table_info('{t}');")
+                cols_list = [col[1] for col in c.fetchall()]
+                diag_lines.append(f"📁 **{t}**:\n`{', '.join(cols_list[:8])}`")
+            conn.close()
+
+            diag_text = "\n\n".join(diag_lines)
+            await status_msg.edit_text(
+                f"⚠️ **Не удалось найти расходы автоматически.**\n\n"
+                f"Вот таблицы внутри вашей базы:\n\n{diag_text}\n\n"
+                f"👉 **Скопируйте этот текст в наш диалог**, и мы сразу подставим ваши точные колонки!"
+            )
             return
 
+        # Если получилось — переносим в базу
         await ensure_default_categories(user_id)
         existing_cats = {name.lower(): name for _, name in await get_user_categories(user_id)}
         imported_cats = set(e[0] for e in expenses)
@@ -400,7 +431,7 @@ async def handle_backup_document(message: types.Message):
             f"• Категорий: **{len(imported_cats)}**\n"
             f"• Общая сумма: **{total_sum:.2f} руб.**\n"
             f"• Период: **{date_range}**\n\n"
-            f"Все данные распределены по месяцам и категориям!"
+            f"Вся история распределена по месяцам! Проверьте **📊 Текущий месяц** и **📅 Выбрать месяц**."
         )
         await status_msg.edit_text(report_text, parse_mode="Markdown")
 
@@ -576,7 +607,6 @@ async def process_new_amount(message: types.Message, state: FSMContext):
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await message.answer(f"✅ Сумма изменена на **{new_amount:.2f} руб.** в категории **{cat_name}**!", reply_markup=keyboard, parse_mode="Markdown")
 
-# ПРИЕМ НАЗВАНИЯ ТОВАРА / ТЕГА
 @dp.message(Form.waiting_for_expense_desc)
 async def process_new_description(message: types.Message, state: FSMContext):
     new_desc = message.text.strip()
@@ -595,9 +625,8 @@ async def process_new_description(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="📈 Аналитика этого товара", callback_data=f"anl_{exp_id}_{cat_id}_ov")]
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer(f"✅ Название товара сохранено: **«{new_desc}»**!\nТеперь этот расход привязан к аналитике этого товара.", reply_markup=keyboard, parse_mode="Markdown")
+    await message.answer(f"✅ Название товара сохранено: **«{new_desc}»**!", reply_markup=keyboard, parse_mode="Markdown")
 
-# Ввод нового расхода
 @dp.message(StateFilter(None), F.text)
 async def handle_expense_input(message: types.Message):
     user_id = message.from_user.id
@@ -753,7 +782,6 @@ async def callback_confirm_del_cat(callback: types.CallbackQuery):
     await callback.message.edit_text(f"🗑️ Категория **«{cat_name}»** удалена.", reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
-# Карточка расхода (с кнопкой "Задать название" и "Аналитика")
 @dp.callback_query(F.data.startswith("exp_"))
 async def callback_expense_details(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -801,7 +829,6 @@ async def callback_expense_details(callback: types.CallbackQuery, state: FSMCont
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
-# Нажатие на "Задать название / тег"
 @dp.callback_query(F.data.startswith("tag_"))
 async def callback_tag_expense(callback: types.CallbackQuery, state: FSMContext):
     _, exp_id, cat_id = callback.data.split("_")
@@ -811,10 +838,8 @@ async def callback_tag_expense(callback: types.CallbackQuery, state: FSMContext)
     buttons = [[InlineKeyboardButton(text="❌ Отмена", callback_data=f"exp_{exp_id}_{cat_id}")]]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text(
-        "Введите название товара или услуги для этого расхода (например, `шампунь` или `корм`):\n\n"
-        "*Это позволит боту объединить этот расход с будущими и прошлыми покупками этого товара по любым ценам!*",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
+        "Введите название товара или услуги (например, `шампунь` или `корм`):",
+        reply_markup=keyboard
     )
     await callback.answer()
 
@@ -845,9 +870,6 @@ async def callback_edit_expense(callback: types.CallbackQuery, state: FSMContext
     await callback.message.edit_text("Введите новую сумму для этого расхода:", reply_markup=keyboard)
     await callback.answer()
 
-
-# ---------------- УМНАЯ АНАЛИТИКА ПО НАЗВАНИЮ ТОВАРА ----------------
-
 async def get_matching_expenses(user_id: int, exp_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
@@ -861,7 +883,6 @@ async def get_matching_expenses(user_id: int, exp_id: int):
 
         cat_name, amount, desc = target
 
-        # Если у расхода есть название товара -> ищем по названию (НЕ по сумме!)
         if desc and len(desc.strip()) > 0:
             clean_word = desc.strip()
             query = """
@@ -873,7 +894,6 @@ async def get_matching_expenses(user_id: int, exp_id: int):
             """
             params = (user_id, cat_name, f"%{clean_word}%")
         else:
-            # Если названия нет -> ищем по точной сумме
             query = """
                 SELECT id, amount, description, created_at 
                 FROM expenses 
@@ -917,7 +937,6 @@ async def callback_expense_analytics(callback: types.CallbackQuery):
         filtered = [x for x in parsed_items if (now - x[0]).total_seconds() <= days * 86400]
         return len(filtered), sum(x[1] for x in filtered)
 
-    # ОБЩИЙ ОБЗОР
     if view_type == "ov":
         w_cnt, w_sum = count_in_days(7)
         m1_cnt, m1_sum = count_in_days(30)
@@ -927,18 +946,13 @@ async def callback_expense_analytics(callback: types.CallbackQuery):
         all_cnt = len(parsed_items)
         all_sum = sum(x[1] for x in parsed_items)
 
-        # Анализ цен товара (средний чек, разброс цен)
         all_amounts = [x[1] for x in parsed_items]
         avg_price = (all_sum / all_cnt) if all_cnt > 0 else 0
         min_p = min(all_amounts) if all_amounts else 0
         max_p = max(all_amounts) if all_amounts else 0
 
-        if min_p != max_p:
-            price_spread = f"• Разброс цен: **от {min_p:.2f} до {max_p:.2f} руб.**\n"
-        else:
-            price_spread = ""
+        price_spread = f"• Разброс цен: **от {min_p:.2f} до {max_p:.2f} руб.**\n" if min_p != max_p else ""
 
-        # Статистика по месяцам
         monthly_stats = {}
         for dt, amt, _, _ in parsed_items:
             ym = dt.strftime("%Y-%m")
@@ -955,7 +969,6 @@ async def callback_expense_analytics(callback: types.CallbackQuery):
 
         months_text = "\n".join(months_report) if months_report else "• Пока нет данных"
 
-        # Расчет средней периодичности
         avg_text = ""
         if len(parsed_items) >= 2:
             oldest_dt = min(x[0] for x in parsed_items)
@@ -1010,7 +1023,6 @@ async def callback_expense_analytics(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # ДЕТАЛИЗАЦИЯ
     days_labels = {
         "7": "7 дней (неделя)",
         "30": "30 дней (1 месяц)",
@@ -1091,5 +1103,7 @@ async def main():
     print(">>> Бот запущен на Render! <<<")
     await dp.start_polling(bot)
 
+if __name__ == "__main__":
+    asyncio.run(main())
 if __name__ == "__main__":
     asyncio.run(main())
