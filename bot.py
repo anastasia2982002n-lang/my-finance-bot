@@ -142,7 +142,7 @@ async def fetch_month_stats(user_id: int, ym_period: str = None):
             return await cursor.fetchall()
 
 
-# ---------------- ПАРСИНГ БАЗЫ ДАННЫХ ----------------
+# ---------------- ПАРСИНГ И ДЕТАЛЬНАЯ ДИАГНОСТИКА ----------------
 def parse_backup_sqlite(sqlite_path):
     conn = sqlite3.connect(sqlite_path)
     cursor = conn.cursor()
@@ -154,7 +154,6 @@ def parse_backup_sqlite(sqlite_path):
     debug_info = ""
 
     if "category" in tables and "transaction" in tables:
-        # 1. Читаем категории из таблицы category
         cursor.execute("PRAGMA table_info('category');")
         cat_cols = [c[1] for c in cursor.fetchall()]
         cursor.execute("SELECT * FROM category;")
@@ -167,12 +166,8 @@ def parse_backup_sqlite(sqlite_path):
         for row in cat_rows:
             uid = str(row[idx_c_uid])
             title = str(row[idx_c_title]).strip()
-            # Пропускаем категории доходов
-            if title.lower() in ["зарплата", "доход", "доходы", "salary", "income", "аванс"]:
-                continue
             cat_map[uid] = title
 
-        # 2. Читаем транзакции из таблицы transaction
         cursor.execute("PRAGMA table_info('transaction');")
         tx_cols = [c[1] for c in cursor.fetchall()]
 
@@ -187,11 +182,13 @@ def parse_backup_sqlite(sqlite_path):
         idx_note = next((i for i, c in enumerate(tx_cols) if c.lower() in ["note", "comment", "description", "memo"]), None)
         idx_rem = next((i for i, c in enumerate(tx_cols) if "remove" in c.lower() or "delete" in c.lower()), None)
 
+        skip_reasons = {"no_cat": 0, "amt_zero": 0, "removed": 0, "amt_none": 0}
+
         for r in tx_rows:
             if idx_rem is not None and r[idx_rem] in [1, "1", True, "true"]:
+                skip_reasons["removed"] += 1
                 continue
 
-            # Ищем связь с категорией среди значений строки
             matched_cat = None
             for val in r:
                 if val is not None and str(val) in cat_map:
@@ -199,16 +196,20 @@ def parse_backup_sqlite(sqlite_path):
                     break
 
             if not matched_cat:
+                skip_reasons["no_cat"] += 1
                 continue
 
             raw_amt = r[idx_amt]
             if raw_amt is None:
+                skip_reasons["amt_none"] += 1
                 continue
             try:
                 amt = abs(float(raw_amt))
                 if amt == 0:
+                    skip_reasons["amt_zero"] += 1
                     continue
             except (ValueError, TypeError):
+                skip_reasons["amt_none"] += 1
                 continue
 
             raw_date = r[idx_date]
@@ -218,9 +219,14 @@ def parse_backup_sqlite(sqlite_path):
             expenses.append((matched_cat, amt, desc, dt_str))
 
         if not expenses:
-            debug_info = f"tx_count={len(tx_rows)}, cat_count={len(cat_map)}"
-            if tx_rows:
-                debug_info += f", sample_tx_cols={tx_cols[:6]}"
+            first_tx = tx_rows[0] if tx_rows else "нет"
+            first_cat = cat_rows[0] if cat_rows else "нет"
+            debug_info = (
+                f"Все колонки transaction:\n{tx_cols}\n\n"
+                f"Пример транзакции:\n{first_tx}\n\n"
+                f"Пример категории:\n{first_cat}\n\n"
+                f"Причины пропуска: {skip_reasons}"
+            )
 
     conn.close()
     return expenses, debug_info
@@ -270,11 +276,10 @@ dp = Dispatcher(storage=MemoryStorage())
 async def cmd_start(message: types.Message):
     await ensure_default_categories(message.from_user.id)
     text = (
-        "👋 Привет! Я твой бот учета финансов с умной аналитикой товаров.\n\n"
-        "💡 **Как пользоваться:**\n"
-        "• **Внести расход:** напиши сумму с названием товара или без (например, `420 шампунь` или `300`).\n"
-        "• **📊 Текущий месяц / 📅 Выбрать месяц:** статистика за текущий или любой прошлый месяц.\n"
-        "• **📂 Мои категории:** детальный просмотр трат, редактирование и умная аналитика.\n\n"
+        "👋 Привет! Я твой бот учета финансов.\n\n"
+        "💡 **Как вносить траты:**\n"
+        "• С названием товара: `420 шампунь` или `890 корм` ➔ выбери категорию.\n"
+        "• Или просто сумму: `350` ➔ название можно задать в любой момент!\n\n"
         "📁 **Импорт:** отправьте в чат ваш файл архива (`.zip` или `.mmbackup`)."
     )
     await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
@@ -321,7 +326,7 @@ async def handle_backup_document(message: types.Message):
         expenses, debug_info = parse_backup_sqlite(extracted_db)
 
         if not expenses:
-            await status_msg.edit_text(f"❌ В базе не удалось найти расходы.\n\nОтладочные данные: `{debug_info}`")
+            await status_msg.edit_text(f"⚠️ **Не удалось привязать расходы.**\n\nВот точные данные из базы:\n\n`{debug_info}`")
             return
 
         await ensure_default_categories(user_id)
@@ -352,7 +357,7 @@ async def handle_backup_document(message: types.Message):
             f"• Категорий: **{len(imported_cats)}**\n"
             f"• Общая сумма: **{total_sum:.2f} руб.**\n"
             f"• Период: **{date_range}**\n\n"
-            f"Все данные распределены по месяцам и категориям! Нажмите **📊 Текущий месяц** или **📅 Выбрать месяц**."
+            f"Все данные распределены по месяцам и категориям!"
         )
         await status_msg.edit_text(report_text, parse_mode="Markdown")
 
