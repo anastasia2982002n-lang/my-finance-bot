@@ -17,7 +17,7 @@ from aiogram.types import (
 )
 
 # Токен берется из настроек сервера Render
-BOT_TOKEN = os.getenv("BOT_TOKEN", "СЮДА_ВСТАВИТЬ_ТОКЕН")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8594928547:AAEBswHuJYtFWwjKSUAhb4Jx_LFyOmIEJ4M")
 DB_NAME = "finance_bot.db"
 
 logging.basicConfig(level=logging.INFO)
