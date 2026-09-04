@@ -151,59 +151,59 @@ def parse_backup_sqlite(sqlite_path):
     tables = [r[0].lower() for r in cursor.fetchall()]
 
     expenses = []
+    debug_info = ""
 
     if "category" in tables and "transaction" in tables:
+        # 1. Читаем категории из таблицы category
         cursor.execute("PRAGMA table_info('category');")
-        cat_cols = {c[1].lower(): c[1] for c in cursor.fetchall()}
-        c_uid = cat_cols.get("uid") or "uid"
-        c_title = cat_cols.get("title") or "title"
-        c_type = cat_cols.get("type")
-
-        cursor.execute(f"SELECT {c_uid}, {c_title}, {c_type if c_type else '0'} FROM category;")
+        cat_cols = [c[1] for c in cursor.fetchall()]
+        cursor.execute("SELECT * FROM category;")
         cat_rows = cursor.fetchall()
 
-        expense_type = None
-        for uid, title, ctype in cat_rows:
-            t_low = str(title).lower()
-            if any(w in t_low for w in ["продукт", "еда", "транспорт", "кафе", "красот", "аптек", "дом", "связь", "авто", "одежд", "развлеч", "кошк", "food", "transport"]):
-                expense_type = ctype
-                break
+        idx_c_uid = next((i for i, c in enumerate(cat_cols) if c.lower() in ["uid", "id"]), 0)
+        idx_c_title = next((i for i, c in enumerate(cat_cols) if c.lower() in ["title", "name"]), 3)
 
         cat_map = {}
-        for uid, title, ctype in cat_rows:
-            if expense_type is not None:
-                if ctype == expense_type:
-                    cat_map[str(uid)] = str(title).strip()
-            else:
-                cat_map[str(uid)] = str(title).strip()
+        for row in cat_rows:
+            uid = str(row[idx_c_uid])
+            title = str(row[idx_c_title]).strip()
+            # Пропускаем категории доходов
+            if title.lower() in ["зарплата", "доход", "доходы", "salary", "income", "аванс"]:
+                continue
+            cat_map[uid] = title
 
+        # 2. Читаем транзакции из таблицы transaction
         cursor.execute("PRAGMA table_info('transaction');")
-        tx_cols = {c[1].lower(): c[1] for c in cursor.fetchall()}
+        tx_cols = [c[1] for c in cursor.fetchall()]
 
-        amt_col = tx_cols.get("amountindefaultcurrency") or tx_cols.get("amountinaccountcurrency") or tx_cols.get("amountinrealcurrency") or "amountInDefaultCurrency"
-        date_col = tx_cols.get("created") or "created"
-        cat_col = next((tx_cols[c] for c in tx_cols if "cat" in c), "categoryUid")
-        note_col = next((tx_cols[c] for c in tx_cols if c in ["note", "comment", "description", "memo"]), None)
-        rem_col = next((tx_cols[c] for c in tx_cols if "remove" in c or "delete" in c), None)
+        cursor.execute("SELECT * FROM 'transaction';")
+        tx_rows = cursor.fetchall()
 
-        q_cols = [amt_col, date_col, cat_col if cat_col in tx_cols.values() else "NULL"]
-        q_cols.append(note_col if note_col else "NULL")
-        q_cols.append(rem_col if rem_col else "NULL")
+        idx_amt = next((i for i, c in enumerate(tx_cols) if "amountindefaultcurrency" in c.lower()), None)
+        if idx_amt is None:
+            idx_amt = next((i for i, c in enumerate(tx_cols) if "amount" in c.lower()), 4)
 
-        cursor.execute(f"SELECT {', '.join(q_cols)} FROM 'transaction';")
-        for r in cursor.fetchall():
-            raw_amt = r[0]
-            raw_date = r[1]
-            raw_cat = r[2]
-            raw_note = r[3]
-            is_removed = r[4]
+        idx_date = next((i for i, c in enumerate(tx_cols) if c.lower() in ["created", "date"]), 1)
+        idx_note = next((i for i, c in enumerate(tx_cols) if c.lower() in ["note", "comment", "description", "memo"]), None)
+        idx_rem = next((i for i, c in enumerate(tx_cols) if "remove" in c.lower() or "delete" in c.lower()), None)
 
-            if is_removed in [1, "1", True, "true"]:
+        for r in tx_rows:
+            if idx_rem is not None and r[idx_rem] in [1, "1", True, "true"]:
                 continue
 
+            # Ищем связь с категорией среди значений строки
+            matched_cat = None
+            for val in r:
+                if val is not None and str(val) in cat_map:
+                    matched_cat = cat_map[str(val)]
+                    break
+
+            if not matched_cat:
+                continue
+
+            raw_amt = r[idx_amt]
             if raw_amt is None:
                 continue
-
             try:
                 amt = abs(float(raw_amt))
                 if amt == 0:
@@ -211,21 +211,19 @@ def parse_backup_sqlite(sqlite_path):
             except (ValueError, TypeError):
                 continue
 
-            cat_uid_str = str(raw_cat).strip() if raw_cat is not None else ""
-            if cat_map:
-                if cat_uid_str not in cat_map:
-                    continue
-                category_name = cat_map[cat_uid_str]
-            else:
-                category_name = "Другое"
-
+            raw_date = r[idx_date]
             dt_str = parse_created_date(raw_date)
-            desc = str(raw_note).strip() if raw_note else ""
+            desc = str(r[idx_note]).strip() if (idx_note is not None and r[idx_note]) else ""
 
-            expenses.append((category_name, amt, desc, dt_str))
+            expenses.append((matched_cat, amt, desc, dt_str))
+
+        if not expenses:
+            debug_info = f"tx_count={len(tx_rows)}, cat_count={len(cat_map)}"
+            if tx_rows:
+                debug_info += f", sample_tx_cols={tx_cols[:6]}"
 
     conn.close()
-    return expenses
+    return expenses, debug_info
 
 
 # ---------------- КЛАВИАТУРЫ ----------------
@@ -320,10 +318,10 @@ async def handle_backup_document(message: types.Message):
             await status_msg.edit_text("❌ В архиве не найден файл базы данных.")
             return
 
-        expenses = parse_backup_sqlite(extracted_db)
+        expenses, debug_info = parse_backup_sqlite(extracted_db)
 
         if not expenses:
-            await status_msg.edit_text("❌ В базе не удалось найти расходы.")
+            await status_msg.edit_text(f"❌ В базе не удалось найти расходы.\n\nОтладочные данные: `{debug_info}`")
             return
 
         await ensure_default_categories(user_id)
