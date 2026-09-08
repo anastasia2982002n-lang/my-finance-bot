@@ -21,7 +21,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8594928547:AAEBswHuJYtFWwjKSUAhb4Jx_LFyOmIEJ4M")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_NAME = "finance_bot.db"
 
 logging.basicConfig(level=logging.INFO)
