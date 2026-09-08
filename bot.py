@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import tempfile
-import aiosqlite
+import asyncpg
 import openpyxl
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -21,8 +21,10 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_NAME = "finance_bot.db"
+raw_token = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = raw_token.strip().replace(" ", "")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip().replace("postgres://", "postgresql://")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -43,6 +45,7 @@ MONTH_NAMES = {
 }
 
 PENDING_EXPENSES = {}
+db_pool = None
 
 class Form(StatesGroup):
     waiting_for_category_name = State()
@@ -50,23 +53,29 @@ class Form(StatesGroup):
     waiting_for_new_amount = State()
     waiting_for_expense_desc = State()
 
-def format_datetime(dt_str: str) -> str:
+def format_datetime(dt_val) -> str:
+    if isinstance(dt_val, (datetime.datetime, datetime.date)):
+        return dt_val.strftime("%d.%m.%Y %H:%M")
+    s = str(dt_val)
     try:
-        parts = dt_str.split(" ")
+        parts = s.split(" ")
         date_parts = parts[0].split("-")
         time_part = parts[1][:5]
         return f"{date_parts[2]}.{date_parts[1]}.{date_parts[0]} {time_part}"
     except Exception:
-        return dt_str
+        return s
 
-def format_short_date(dt_str: str) -> str:
+def format_short_date(dt_val) -> str:
+    if isinstance(dt_val, (datetime.datetime, datetime.date)):
+        return dt_val.strftime("%d.%m %H:%M")
+    s = str(dt_val)
     try:
-        parts = dt_str.split(" ")
+        parts = s.split(" ")
         date_parts = parts[0].split("-")
         time_part = parts[1][:5]
         return f"{date_parts[2]}.{date_parts[1]} {time_part}"
     except Exception:
-        return dt_str
+        return s
 
 def get_month_title(ym_str: str) -> str:
     try:
@@ -75,76 +84,84 @@ def get_month_title(ym_str: str) -> str:
     except Exception:
         return ym_str
 
-def normalize_date_string(val):
+def normalize_date_obj(val):
     if not val:
-        return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    if isinstance(val, (datetime.datetime, datetime.date)):
-        return val.strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.datetime.utcnow()
+    if isinstance(val, datetime.datetime):
+        return val
+    if isinstance(val, datetime.date):
+        return datetime.datetime.combine(val, datetime.time(12, 0))
     s = str(val).replace("T", " ").replace("Z", "").strip()
     match = re.search(r'(\d{1,4})[./-](\d{1,2})[./-](\d{1,4})', s)
     if match:
         p1, p2, p3 = match.groups()
         if len(p1) == 4:
-            return f"{p1}-{int(p2):02d}-{int(p3):02d} 12:00:00"
+            return datetime.datetime(int(p1), int(p2), int(p3), 12, 0)
         elif len(p3) == 4:
-            return f"{p3}-{int(p2):02d}-{int(p1):02d} 12:00:00"
-    if len(s) >= 19:
-        return s[:19]
-    return s
+            return datetime.datetime(int(p3), int(p2), int(p1), 12, 0)
+    try:
+        return datetime.datetime.fromisoformat(s[:19])
+    except Exception:
+        return datetime.datetime.utcnow()
 
 
-# ---------------- БАЗА ДАННЫХ ----------------
+# ---------------- БАЗА ДАННЫХ (POSTGRESQL / NEON) ----------------
+async def get_pool():
+    global db_pool
+    if db_pool is None:
+        db_pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5)
+    return db_pool
+
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, category_name TEXT, amount REAL, description TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("CREATE TABLE IF NOT EXISTS categories (id SERIAL PRIMARY KEY, user_id BIGINT, name TEXT)")
+        await conn.execute("CREATE TABLE IF NOT EXISTS expenses (id SERIAL PRIMARY KEY, user_id BIGINT, category_name TEXT, amount NUMERIC(12, 2), description TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
 
 async def ensure_default_categories(user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM categories WHERE user_id = ?", (user_id,)) as cursor:
-            count = (await cursor.fetchone())[0]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        count = await conn.fetchval("SELECT COUNT(*) FROM categories WHERE user_id = $1", user_id)
         if count == 0:
             for cat in DEFAULT_CATEGORIES:
-                await db.execute("INSERT INTO categories (user_id, name) VALUES (?, ?)", (user_id, cat))
-            await db.commit()
+                await conn.execute("INSERT INTO categories (user_id, name) VALUES ($1, $2)", user_id, cat)
 
 async def get_user_categories(user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT id, name FROM categories WHERE user_id = ?", (user_id,)) as cursor:
-            return await cursor.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, name FROM categories WHERE user_id = $1 ORDER BY id", user_id)
+        return [(r["id"], r["name"]) for r in rows]
 
-async def add_expense(user_id: int, category_name: str, amount: float, description: str = "", created_at: str = None):
-    async with aiosqlite.connect(DB_NAME) as db:
+async def add_expense(user_id: int, category_name: str, amount: float, description: str = "", created_at=None):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         if created_at:
-            await db.execute(
-                "INSERT INTO expenses (user_id, category_name, amount, description, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, category_name, amount, description, created_at)
+            dt_obj = normalize_date_obj(created_at)
+            await conn.execute(
+                "INSERT INTO expenses (user_id, category_name, amount, description, created_at) VALUES ($1, $2, $3, $4, $5)",
+                user_id, category_name, amount, description, dt_obj
             )
         else:
-            await db.execute(
-                "INSERT INTO expenses (user_id, category_name, amount, description) VALUES (?, ?, ?, ?)",
-                (user_id, category_name, amount, description)
+            await conn.execute(
+                "INSERT INTO expenses (user_id, category_name, amount, description) VALUES ($1, $2, $3, $4)",
+                user_id, category_name, amount, description
             )
-        await db.commit()
 
 async def fetch_month_stats(user_id: int, ym_period: str = None):
-    async with aiosqlite.connect(DB_NAME) as db:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         if ym_period and ym_period != "all":
-            query = "SELECT category_name, SUM(amount) FROM expenses WHERE user_id = ? AND strftime('%Y-%m', created_at) = ? GROUP BY category_name ORDER BY SUM(amount) DESC"
-            params = (user_id, ym_period)
+            query = "SELECT category_name, SUM(amount) as s FROM expenses WHERE user_id = $1 AND TO_CHAR(created_at, 'YYYY-MM') = $2 GROUP BY category_name ORDER BY s DESC"
+            rows = await conn.fetch(query, user_id, ym_period)
         else:
-            query = "SELECT category_name, SUM(amount) FROM expenses WHERE user_id = ? GROUP BY category_name ORDER BY SUM(amount) DESC"
-            params = (user_id,)
-
-        async with db.execute(query, params) as cursor:
-            return await cursor.fetchall()
+            query = "SELECT category_name, SUM(amount) as s FROM expenses WHERE user_id = $1 GROUP BY category_name ORDER BY s DESC"
+            rows = await conn.fetch(query, user_id)
+        return [(r["category_name"], float(r["s"])) for r in rows]
 
 
-# ---------------- ТОЧНЫЙ ПАРСИНГ EXCEL ----------------
+# ---------------- ПАРСИНГ EXCEL ----------------
 def parse_excel_or_csv(file_path):
     expenses = []
-
     try:
         wb = openpyxl.load_workbook(file_path, data_only=True)
         sheets = wb.worksheets
@@ -157,12 +174,11 @@ def parse_excel_or_csv(file_path):
         if not rows or len(rows) < 2:
             continue
 
-        # Ищем строку с заголовками колонок (где есть "Дата" или "Категория")
         header_idx = -1
         col_date = 0
         col_cat = 1
-        col_amt = 3  # Колонка D по умолчанию (Сумма в валюте счета)
-        col_desc = 8  # Колонка I по умолчанию (Комментарий)
+        col_amt = 3
+        col_desc = 8
 
         for r_i, r in enumerate(rows[:6]):
             r_str = [str(c).lower().strip() if c is not None else "" for c in r]
@@ -177,7 +193,6 @@ def parse_excel_or_csv(file_path):
                     col_amt = c_i
                 elif "комментарий" in cell or "теги" in cell:
                     col_desc = c_i
-
             if header_idx != -1:
                 break
 
@@ -199,7 +214,6 @@ def parse_excel_or_csv(file_path):
             if not cat_str or any(cat_str.lower().startswith(w) for w in ["список", "категория", "дата"]):
                 continue
 
-            # Парсим сумму (убираем пробелы, меняем запятую на точку)
             amt_str = str(raw_amt).replace(" ", "").replace("\xa0", "").replace(",", ".").strip()
             match = re.search(r"(\d+(?:\.\d+)?)", amt_str)
             if not match:
@@ -208,10 +222,9 @@ def parse_excel_or_csv(file_path):
             if amt == 0:
                 continue
 
-            dt_str = normalize_date_string(raw_date)
+            dt_obj = normalize_date_obj(raw_date)
             desc_str = str(raw_desc).strip() if raw_desc is not None else ""
-
-            expenses.append((cat_str, amt, desc_str, dt_str))
+            expenses.append((cat_str, amt, desc_str, dt_obj))
 
     return expenses
 
@@ -259,15 +272,15 @@ dp = Dispatcher(storage=MemoryStorage())
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await ensure_default_categories(message.from_user.id)
-    text = "👋 Привет! Я твой бот учета финансов с умной аналитикой.\n\n💡 **Как вносить траты:**\n• С названием товара: `420 шампунь` или `890 корм` ➔ выбери категорию.\n• Или просто сумму: `350` ➔ категорию выбери кнопкой.\n\n📁 **Импорт истории:** отправьте сюда файл Excel (`.xlsx`), выгруженный из вашего приложения!"
+    text = "👋 Привет! Я твой бот учета финансов с надежным облачным хранением в PostgreSQL.\n\n💡 **Как вносить траты:**\n• С названием товара: `420 шампунь` или `890 корм` ➔ выбери категорию.\n• Или просто сумму: `350` ➔ категорию выбери кнопкой.\n\n📁 **Импорт истории:** отправьте сюда файл Excel (`.xlsx`), выгруженный из вашего приложения!"
     await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
 @dp.message(F.text == "/clear_expenses")
 async def cmd_clear_expenses(message: types.Message):
     user_id = message.from_user.id
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM expenses WHERE user_id = ?", (user_id,))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM expenses WHERE user_id = $1", user_id)
     await message.answer("🧹 База расходов полностью очищена.")
 
 # ПРИЕМ ФАЙЛОВ EXCEL
@@ -281,13 +294,12 @@ async def handle_excel_document(message: types.Message):
         await message.answer("Пожалуйста, отправьте файл таблицы в формате **`.xlsx`**.")
         return
 
-    # Удаляем старую тестовую категорию "Другое"
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM expenses WHERE user_id = ? AND category_name = '📦 Другое'", (user_id,))
-        await db.execute("DELETE FROM categories WHERE user_id = ? AND name = '📦 Другое'", (user_id,))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM expenses WHERE user_id = $1 AND category_name = '📦 Другое'", user_id)
+        await conn.execute("DELETE FROM categories WHERE user_id = $1 AND name = '📦 Другое'", user_id)
 
-    status_msg = await message.answer("⏳ Читаю таблицу Excel и переношу расходы...")
+    status_msg = await message.answer("⏳ Читаю таблицу Excel и переношу расходы в постоянную базу...")
     temp_dir = tempfile.mkdtemp()
 
     try:
@@ -305,25 +317,24 @@ async def handle_excel_document(message: types.Message):
         existing_cats = {name.lower(): name for _, name in await get_user_categories(user_id)}
         imported_cats = set(e[0] for e in expenses)
 
-        async with aiosqlite.connect(DB_NAME) as db:
+        async with pool.acquire() as conn:
             for c_name in imported_cats:
                 if c_name.lower() not in existing_cats:
-                    await db.execute("INSERT INTO categories (user_id, name) VALUES (?, ?)", (user_id, c_name))
+                    await conn.execute("INSERT INTO categories (user_id, name) VALUES ($1, $2)", user_id, c_name)
                     existing_cats[c_name.lower()] = c_name
 
-            for cat_name, amt, desc, dt_str in expenses:
+            for cat_name, amt, desc, dt_obj in expenses:
                 final_cat = existing_cats.get(cat_name.lower(), cat_name)
-                await db.execute(
-                    "INSERT INTO expenses (user_id, category_name, amount, description, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, final_cat, amt, desc, dt_str)
+                await conn.execute(
+                    "INSERT INTO expenses (user_id, category_name, amount, description, created_at) VALUES ($1, $2, $3, $4, $5)",
+                    user_id, final_cat, amt, desc, dt_obj
                 )
-            await db.commit()
 
         total_sum = sum(e[1] for e in expenses)
-        dates = [e[3][:10] for e in expenses if len(e[3]) >= 10]
+        dates = [e[3].strftime("%d.%m.%Y") for e in expenses]
         date_range = f"с {min(dates)} по {max(dates)}" if dates else ""
 
-        report_text = f"🎉 **Импорт из Excel успешно завершен!**\n\n• Перенесено трат: **{len(expenses)}**\n• Категорий: **{len(imported_cats)}**\n• Общая сумма: **{total_sum:.2f} руб.**\n• Период: **{date_range}**\n\nВсе данные разложены по настоящим категориям и месяцам! Нажмите **📊 Текущий месяц** или **📅 Выбрать месяц**."
+        report_text = f"🎉 **Импорт из Excel успешно завершен!**\n\n• Перенесено трат: **{len(expenses)}**\n• Категорий: **{len(imported_cats)}**\n• Общая сумма: **{total_sum:.2f} руб.**\n• Период: **{date_range}**\n\nВсе данные сохранены в облачную базу данных навсегда!"
         await status_msg.edit_text(report_text, parse_mode="Markdown")
 
     except Exception as ex:
@@ -360,16 +371,17 @@ async def show_current_month_stats(message: types.Message):
 @dp.message(F.text == "📅 Выбрать месяц")
 async def choose_month_menu(message: types.Message):
     user_id = message.from_user.id
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT DISTINCT strftime('%Y-%m', created_at) FROM expenses WHERE user_id = ? ORDER BY created_at DESC", (user_id,)) as cursor:
-            rows = await cursor.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT DISTINCT TO_CHAR(created_at, 'YYYY-MM') as ym FROM expenses WHERE user_id = $1 ORDER BY ym DESC", user_id)
 
     if not rows:
         await message.answer("У вас пока нет сохраненных расходов.")
         return
 
     buttons = []
-    for (ym,) in rows:
+    for r in rows:
+        ym = r["ym"]
         title = get_month_title(ym)
         buttons.append([InlineKeyboardButton(text=f"📅 {title}", callback_data=f"mstats_{ym}")])
 
@@ -404,12 +416,13 @@ async def callback_show_month_stats(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "b_months")
 async def callback_back_to_months(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT DISTINCT strftime('%Y-%m', created_at) FROM expenses WHERE user_id = ? ORDER BY created_at DESC", (user_id,)) as cursor:
-            rows = await cursor.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT DISTINCT TO_CHAR(created_at, 'YYYY-MM') as ym FROM expenses WHERE user_id = $1 ORDER BY ym DESC", user_id)
 
     buttons = []
-    for (ym,) in rows:
+    for r in rows:
+        ym = r["ym"]
         title = get_month_title(ym)
         buttons.append([InlineKeyboardButton(text=f"📅 {title}", callback_data=f"mstats_{ym}")])
 
@@ -435,9 +448,9 @@ async def process_category_name(message: types.Message, state: FSMContext):
     cat_name = message.text.strip()
     user_id = message.from_user.id
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT INTO categories (user_id, name) VALUES (?, ?)", (user_id, cat_name))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO categories (user_id, name) VALUES ($1, $2)", user_id, cat_name)
 
     await state.clear()
     await message.answer(f"✅ Категория **«{cat_name}»** сохранена!", reply_markup=get_main_keyboard(), parse_mode="Markdown")
@@ -449,14 +462,12 @@ async def process_rename_category(message: types.Message, state: FSMContext):
     cat_id = data.get("cat_id")
     user_id = message.from_user.id
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT name FROM categories WHERE id = ? AND user_id = ?", (cat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            old_name = row[0] if row else ""
-
-        await db.execute("UPDATE categories SET name = ? WHERE id = ? AND user_id = ?", (new_name, cat_id, user_id))
-        await db.execute("UPDATE expenses SET category_name = ? WHERE category_name = ? AND user_id = ?", (new_name, old_name, user_id))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        old_name = await conn.fetchval("SELECT name FROM categories WHERE id = $1 AND user_id = $2", cat_id, user_id)
+        if old_name:
+            await conn.execute("UPDATE categories SET name = $1 WHERE id = $2 AND user_id = $3", new_name, cat_id, user_id)
+            await conn.execute("UPDATE expenses SET category_name = $1 WHERE category_name = $2 AND user_id = $3", new_name, old_name, user_id)
 
     await state.clear()
     buttons = [[InlineKeyboardButton(text="◀️ Вернуться к категории", callback_data=f"vcat_{cat_id}")]]
@@ -477,12 +488,10 @@ async def process_new_amount(message: types.Message, state: FSMContext):
     cat_id = data.get("cat_id")
     user_id = message.from_user.id
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE expenses SET amount = ? WHERE id = ? AND user_id = ?", (new_amount, exp_id, user_id))
-        await db.commit()
-        async with db.execute("SELECT category_name FROM expenses WHERE id = ?", (exp_id,)) as cursor:
-            row = await cursor.fetchone()
-            cat_name = row[0] if row else ""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE expenses SET amount = $1 WHERE id = $2 AND user_id = $3", new_amount, exp_id, user_id)
+        cat_name = await conn.fetchval("SELECT category_name FROM expenses WHERE id = $1", exp_id)
 
     await state.clear()
     buttons = [
@@ -500,9 +509,9 @@ async def process_new_description(message: types.Message, state: FSMContext):
     cat_id = data.get("cat_id")
     user_id = message.from_user.id
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE expenses SET description = ? WHERE id = ? AND user_id = ?", (new_desc, exp_id, user_id))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE expenses SET description = $1 WHERE id = $2 AND user_id = $3", new_desc, exp_id, user_id)
 
     await state.clear()
     buttons = [
@@ -561,12 +570,11 @@ async def callback_add_expense(callback: types.CallbackQuery):
         amount = float(amount_fallback)
         description = ""
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT name FROM categories WHERE id = ? AND user_id = ?", (cat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            category_name = row[0] if row else ""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        category_name = await conn.fetchval("SELECT name FROM categories WHERE id = $1 AND user_id = $2", cat_id, user_id)
 
-    await add_expense(user_id, category_name, amount, description)
+    await add_expense(user_id, category_name or "📦 Другое", amount, description)
     desc_text = f" (*{description}*)" if description else ""
     await callback.message.edit_text(f"✅ Записано: **{amount:.2f} руб.**{desc_text} в категорию **{category_name}**", parse_mode="Markdown")
     await callback.answer()
@@ -585,19 +593,23 @@ async def callback_view_category(callback: types.CallbackQuery, state: FSMContex
     cat_id = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT name FROM categories WHERE id = ? AND user_id = ?", (cat_id, user_id)) as cursor:
-            cat_row = await cursor.fetchone()
-            category_name = cat_row[0] if cat_row else ""
-
-        async with db.execute("SELECT id, amount, description, created_at FROM expenses WHERE user_id = ? AND category_name = ? ORDER BY id DESC LIMIT 15", (user_id, category_name)) as cursor:
-            expenses = await cursor.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        category_name = await conn.fetchval("SELECT name FROM categories WHERE id = $1 AND user_id = $2", cat_id, user_id)
+        rows = await conn.fetch(
+            "SELECT id, amount, description, created_at FROM expenses WHERE user_id = $1 AND category_name = $2 ORDER BY id DESC LIMIT 15",
+            user_id, category_name
+        )
 
     buttons = []
-    for exp_id, amount, desc, created_at in expenses:
-        date_short = format_short_date(created_at)
+    for r in rows:
+        exp_id = r["id"]
+        amt = float(r["amount"])
+        desc = r["description"]
+        dt = r["created_at"]
+        date_short = format_short_date(dt)
         desc_label = f" — {desc[:10]}" if desc else ""
-        btn_text = f"{amount:.2f} руб.{desc_label} ({date_short})"
+        btn_text = f"{amt:.2f} руб.{desc_label} ({date_short})"
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"exp_{exp_id}_{cat_id}")])
 
     buttons.append([
@@ -608,7 +620,7 @@ async def callback_view_category(callback: types.CallbackQuery, state: FSMContex
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await callback.message.edit_text(
-        f"📂 Категория: **{category_name}** ({len(expenses)} записей)\n*Нажмите на расход для изменения, названия товара или аналитики:*",
+        f"📂 Категория: **{category_name}** ({len(rows)} записей)\n*Нажмите на расход для изменения, названия товара или аналитики:*",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -630,10 +642,9 @@ async def callback_ask_del_cat(callback: types.CallbackQuery):
     cat_id = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT name FROM categories WHERE id = ? AND user_id = ?", (cat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            cat_name = row[0] if row else ""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        cat_name = await conn.fetchval("SELECT name FROM categories WHERE id = $1 AND user_id = $2", cat_id, user_id)
 
     text = f"⚠️ **Удалить категорию «{cat_name}»?**\nВсе записанные расходы внутри нее также будут удалены!"
     buttons = [
@@ -649,15 +660,12 @@ async def callback_confirm_del_cat(callback: types.CallbackQuery):
     cat_id = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT name FROM categories WHERE id = ? AND user_id = ?", (cat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            cat_name = row[0] if row else ""
-
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        cat_name = await conn.fetchval("SELECT name FROM categories WHERE id = $1 AND user_id = $2", cat_id, user_id)
         if cat_name:
-            await db.execute("DELETE FROM categories WHERE id = ? AND user_id = ?", (cat_id, user_id))
-            await db.execute("DELETE FROM expenses WHERE category_name = ? AND user_id = ?", (cat_name, user_id))
-            await db.commit()
+            await conn.execute("DELETE FROM categories WHERE id = $1 AND user_id = $2", cat_id, user_id)
+            await conn.execute("DELETE FROM expenses WHERE category_name = $1 AND user_id = $2", cat_name, user_id)
 
     buttons = [[InlineKeyboardButton(text="◀️ Ко всем категориям", callback_data="b_cats")]]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -672,15 +680,18 @@ async def callback_expense_details(callback: types.CallbackQuery, state: FSMCont
     cat_id = int(cat_id)
     user_id = callback.from_user.id
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT category_name, amount, description, created_at FROM expenses WHERE id = ? AND user_id = ?", (exp_id, user_id)) as cursor:
-            exp = await cursor.fetchone()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT category_name, amount, description, created_at FROM expenses WHERE id = $1 AND user_id = $2", exp_id, user_id)
 
-    if not exp:
+    if not row:
         await callback.message.edit_text("Расход не найден.")
         return
 
-    cat_name, amount, desc, created_at = exp
+    cat_name = row["category_name"]
+    amount = float(row["amount"])
+    desc = row["description"]
+    created_at = row["created_at"]
     date_formatted = format_datetime(created_at)
     desc_text = f"• Товар/услуга: **{desc}**\n" if desc else "• Товар/услуга: *не указано*\n"
 
@@ -719,9 +730,9 @@ async def callback_delete_expense(callback: types.CallbackQuery):
     cat_id = int(cat_id)
     user_id = callback.from_user.id
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM expenses WHERE id = ? AND user_id = ?", (exp_id, user_id))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM expenses WHERE id = $1 AND user_id = $2", exp_id, user_id)
 
     buttons = [[InlineKeyboardButton(text="◀️ Вернуться к расходам", callback_data=f"vcat_{cat_id}")]]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -740,26 +751,25 @@ async def callback_edit_expense(callback: types.CallbackQuery, state: FSMContext
     await callback.answer()
 
 async def get_matching_expenses(user_id: int, exp_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT category_name, amount, description FROM expenses WHERE id = ? AND user_id = ?", (exp_id, user_id)) as cursor:
-            target = await cursor.fetchone()
-
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        target = await conn.fetchrow("SELECT category_name, amount, description FROM expenses WHERE id = $1 AND user_id = $2", exp_id, user_id)
         if not target:
             return None, []
 
-        cat_name, amount, desc = target
+        cat_name = target["category_name"]
+        amount = float(target["amount"])
+        desc = target["description"]
 
         if desc and len(desc.strip()) > 0:
             clean_word = desc.strip()
-            query = "SELECT id, amount, description, created_at FROM expenses WHERE user_id = ? AND category_name = ? AND LOWER(description) LIKE LOWER(?) ORDER BY created_at DESC"
-            params = (user_id, cat_name, f"%{clean_word}%")
+            query = "SELECT id, amount, description, created_at FROM expenses WHERE user_id = $1 AND category_name = $2 AND description ILIKE $3 ORDER BY created_at DESC"
+            rows = await conn.fetch(query, user_id, cat_name, f"%{clean_word}%")
         else:
-            query = "SELECT id, amount, description, created_at FROM expenses WHERE user_id = ? AND category_name = ? AND amount = ? ORDER BY created_at DESC"
-            params = (user_id, cat_name, amount)
+            query = "SELECT id, amount, description, created_at FROM expenses WHERE user_id = $1 AND category_name = $2 AND amount = $3 ORDER BY created_at DESC"
+            rows = await conn.fetch(query, user_id, cat_name, amount)
 
-        async with db.execute(query, params) as cursor:
-            rows = await cursor.fetchall()
-            return target, rows
+        return (cat_name, amount, desc), rows
 
 @dp.callback_query(F.data.startswith("anl_"))
 async def callback_expense_analytics(callback: types.CallbackQuery):
@@ -781,12 +791,11 @@ async def callback_expense_analytics(callback: types.CallbackQuery):
 
     now = datetime.datetime.utcnow()
     parsed_items = []
-    for mid, m_amount, m_desc, m_created_at in matching_rows:
-        try:
-            dt = datetime.datetime.strptime(m_created_at, "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            dt = now
-        parsed_items.append((dt, m_amount, m_created_at, m_desc))
+    for r in matching_rows:
+        dt = r["created_at"]
+        amt = float(r["amount"])
+        desc = r["description"]
+        parsed_items.append((dt, amt, dt, desc))
 
     def count_in_days(days: int):
         filtered = [x for x in parsed_items if (now - x[0]).total_seconds() <= days * 86400]
@@ -876,8 +885,8 @@ async def callback_expense_analytics(callback: types.CallbackQuery):
     sum_period = sum(x[1] for x in selected_items)
 
     dates_lines = []
-    for idx, (_, amt, raw_dt, d_text) in enumerate(selected_items[:12], 1):
-        f_dt = format_datetime(raw_dt)
+    for idx, (dt, amt, _, d_text) in enumerate(selected_items[:12], 1):
+        f_dt = format_datetime(dt)
         note = f" ({d_text})" if d_text else ""
         dates_lines.append(f"{idx}. {f_dt} — **{amt:.2f} руб.**{note}")
 
@@ -926,7 +935,7 @@ async def start_web_server():
 async def main():
     await init_db()
     await start_web_server()
-    print(">>> Бот запущен на Render! <<<")
+    print(">>> Бот запущен на Render с базой PostgreSQL! <<<")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
